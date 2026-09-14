@@ -10,10 +10,10 @@ from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSta
 from PyQt6.QtGui import QIcon, QGuiApplication
 from PyQt6.QtCore import QMutex, Qt
 
-from bioview.components import UsrpDeviceConfigPanel, LogDisplayPanel, ExperimentSettingsPanel, PlotGrid, AppControlPanel, AnnotateEventPanel, DeviceStatusPanel, TextDialog
+from bioview.components import UsrpDeviceConfigPanel, LogDisplayPanel, ExperimentSettingsPanel, PlotGrid, AppControlPanel, AnnotateEventPanel, DeviceStatusPanel, TextDialog, CalibrationPanel
 from bioview.types import ConnectionStatus, RunningStatus, UsrpConfiguration, ExperimentConfiguration
-from bioview.usrp import UsrpController, UsrpReceiver, UsrpTransmitter
-from bioview.common import SaveWorker, DisplayWorker, InstructionsWorker
+from bioview.usrp import UsrpController, UsrpReceiver, UsrpTransmitter, CalibrationTransmitWorker
+from bioview.common import SaveWorker, DisplayWorker, InstructionsWorker, CalibrationAnalyzer, CalibrationAnalysisWorker, write_calibration_result
 from bioview.biopac import BiopacController
 from bioview.utils import get_channel_map
     
@@ -78,15 +78,23 @@ class Viewer(QMainWindow):
         self.bio_init_thread = None 
         self.bio_rx_thread = None 
         # Common
-        self.save_thread = None 
-        self.display_thread = None 
+        self.save_thread = None
+        self.display_thread = None
         self.instructions_thread = None
-        
+
         ### Data Queues
         self.rx_queues = [queue.Queue() for _ in range(len(self.usrp_config))]
         self.disp_queue = queue.Queue(maxsize=10000)
-        
-        ### Make Connections 
+
+        ### Calibration state - fully separate from recording (mutually exclusive)
+        self.calibrating = False
+        self.cal_rx_queues = [queue.Queue() for _ in range(len(self.usrp_config))]
+        self.usrp_cal_tx_thread = [None] * len(self.usrp_config)
+        self.usrp_cal_rx_thread = [None] * len(self.usrp_config)
+        self.cal_analysis_thread = None
+        self.calibration_analyzer = None
+
+        ### Make Connections
         self._connect_logging()
     
     def _init_ui(self): 
@@ -120,7 +128,13 @@ class Viewer(QMainWindow):
         self.app_control_panel.saveRequested.connect(self.update_save_state)
         self.app_control_panel.instructionsEnabled.connect(self.toggle_instructions)
         self.app_control_panel.balanceRequested.connect(self.balance_signals)
-        
+
+        ### Calibration Panel
+        cal_labels = [label for row in self.exp_config.channel_mapping for label in row if label]
+        self.calibration_panel = CalibrationPanel(cal_labels)
+        controls_layout.addWidget(self.calibration_panel, stretch=1)
+        self.calibration_panel.calibrationRequested.connect(self.start_calibration)
+
         experiment_layout = QHBoxLayout()
         
         ### Experiment Control Panel
@@ -370,9 +384,88 @@ class Viewer(QMainWindow):
         # TODO: Implement signal balancing here 
         pass 
       
-    def update_buttons(self): 
+    def update_buttons(self):
         self.app_control_panel.update_button_states(self.connection_status, self.running_status)
         self.experiment_settings_panel.update_button_states(self.connection_status, self.running_status)
+        self.calibration_panel.update_button_states(self.connection_status, self.running_status)
+
+    def start_calibration(self):
+        # Mutually exclusive with Recording - guarded here even though the button is already
+        # disabled in that state, since update_button_states is the only other gate
+        if self.calibrating or self.running_status == RunningStatus.RUNNING:
+            return
+        if self.connection_status != ConnectionStatus.CONNECTED:
+            return
+
+        self.calibrating = True
+        self.calibration_panel.set_running(True)
+        self.update_buttons()
+
+        for idx, cfg in enumerate(self.usrp_config):
+            self.usrp_cal_tx_thread[idx] = CalibrationTransmitWorker(
+                config=cfg,
+                usrp=self.usrps[idx],
+                tx_streamer=self.tx_streamers[idx],
+                duration_s=30.0,
+            )
+            self.usrp_cal_tx_thread[idx].logEvent.connect(self.log_display_panel.log_message)
+            if idx == 0:
+                self.usrp_cal_tx_thread[idx].finished.connect(self.finish_calibration)
+            self.usrp_cal_tx_thread[idx].start()
+
+            self.usrp_cal_rx_thread[idx] = UsrpReceiver(
+                usrp=self.usrps[idx],
+                config=cfg,
+                rx_streamer=self.rx_streamers[idx],
+                rx_queue=self.cal_rx_queues[idx],
+                running=True,
+            )
+            self.usrp_cal_rx_thread[idx].logEvent.connect(self.log_display_panel.log_message)
+            self.usrp_cal_rx_thread[idx].start()
+
+        self.calibration_analyzer = CalibrationAnalyzer(self.exp_config)
+        self.cal_analysis_thread = CalibrationAnalysisWorker(
+            analyzer=self.calibration_analyzer,
+            rx_queues=self.cal_rx_queues,
+            running=True,
+        )
+        self.cal_analysis_thread.logEvent.connect(self.log_display_panel.log_message)
+        self.cal_analysis_thread.start()
+
+    def finish_calibration(self):
+        if not self.calibrating:
+            return
+
+        for idx in range(len(self.usrp_config)):
+            tx_thread = self.usrp_cal_tx_thread[idx]
+            if tx_thread is not None:
+                tx_thread.stop()
+                tx_thread.wait()
+                self.usrp_cal_tx_thread[idx] = None
+
+            rx_thread = self.usrp_cal_rx_thread[idx]
+            if rx_thread is not None:
+                rx_thread.stop()
+                rx_thread.wait()
+                self.usrp_cal_rx_thread[idx] = None
+
+        if self.cal_analysis_thread is not None:
+            self.cal_analysis_thread.stop()
+            self.cal_analysis_thread.wait()
+            self.cal_analysis_thread = None
+
+        channels = self.calibration_analyzer.result() if self.calibration_analyzer is not None else {}
+        try:
+            out_path = write_calibration_result(self.exp_config, self.usrp_config, channels)
+            self.log_display_panel.log_message('info', f'Calibration saved to {out_path}')
+        except Exception as e:
+            self.log_display_panel.log_message('error', f'Failed to save calibration results: {e}')
+
+        self.calibration_panel.show_result(channels)
+        self.calibration_analyzer = None
+        self.calibrating = False
+        self.calibration_panel.set_running(False)
+        self.update_buttons()
     
     def on_usrp_init_success(self, usrp, tx_streamer, rx_streamer, idx=0):
         self.usrps[idx] = usrp
@@ -459,8 +552,25 @@ class Viewer(QMainWindow):
 
     def closeEvent(self, a0):
         self.stop_recording()
+        self._abort_calibration_threads()
         self.annotate_event_panel.shutdown()
         return super().closeEvent(a0)
+
+    def _abort_calibration_threads(self):
+        # Used on app close mid-calibration - just tears threads down, no result/save
+        if not self.calibrating:
+            return
+        for idx in range(len(self.usrp_config)):
+            if self.usrp_cal_tx_thread[idx] is not None:
+                self.usrp_cal_tx_thread[idx].stop()
+                self.usrp_cal_tx_thread[idx].wait()
+            if self.usrp_cal_rx_thread[idx] is not None:
+                self.usrp_cal_rx_thread[idx].stop()
+                self.usrp_cal_rx_thread[idx].wait()
+        if self.cal_analysis_thread is not None:
+            self.cal_analysis_thread.stop()
+            self.cal_analysis_thread.wait()
+        self.calibrating = False
 
     
 

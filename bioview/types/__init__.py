@@ -1,2 +1,2 @@
 from .config import UsrpConfiguration, ExperimentConfiguration, BiopacConfiguration
-from .status import RunningStatus, ConnectionStatus
+from .status import RunningStatus, ConnectionStatus, ChannelQualityStatus

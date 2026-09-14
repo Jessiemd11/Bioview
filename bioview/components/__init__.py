@@ -6,3 +6,4 @@ from .log_display import LogDisplayPanel
 from .annotate_event import AnnotateEventPanel
 from .device_status import DeviceStatusPanel
 from .text_dialog import TextDialog
+from .calibration_panel import CalibrationPanel
