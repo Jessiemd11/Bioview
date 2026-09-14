@@ -176,14 +176,18 @@ class SaveWorker(QThread):
                     processed = self._process(buffer_data) 
                     self.logEvent.emit('debug', f'Processed data shape {processed.shape}')   
                     
-                    # Add to display queue 
-                    try: 
+                    # Add to display queue
+                    try:
                         self.disp_queue.put(processed)
-                    except queue.Empty: 
-                        self.logEvent.emit('debug', 'Display Queue Empty')    
-                    except queue.Full: 
+                    except queue.Empty:
+                        self.logEvent.emit('debug', 'Display Queue Empty')
+                    except queue.Full:
                         self.logEvent.emit('debug', 'Display Queue Full')
-                    
+
+                    # Let any other in-process consumer (e.g. calibration analysis) react
+                    # to each processed batch without going through a queue
+                    self.data_ready.emit({'data': processed, 'mapping': self.exp_config.data_mapping})
+
                     # Add to save queue as well (asynchronously save using save queue if performance is an issue)
                     
                     # Write to file, only if saving 

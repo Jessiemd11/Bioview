@@ -13,7 +13,7 @@ from PyQt6.QtCore import QMutex, Qt
 from bioview.components import UsrpDeviceConfigPanel, LogDisplayPanel, ExperimentSettingsPanel, PlotGrid, AppControlPanel, AnnotateEventPanel, DeviceStatusPanel, TextDialog, CalibrationPanel
 from bioview.types import ConnectionStatus, RunningStatus, UsrpConfiguration, ExperimentConfiguration
 from bioview.usrp import UsrpController, UsrpReceiver, UsrpTransmitter, CalibrationTransmitWorker
-from bioview.common import SaveWorker, DisplayWorker, InstructionsWorker, CalibrationAnalyzer, CalibrationAnalysisWorker, write_calibration_result
+from bioview.common import SaveWorker, DisplayWorker, InstructionsWorker, CalibrationAnalyzer, write_calibration_result
 from bioview.biopac import BiopacController
 from bioview.utils import get_channel_map
     
@@ -85,13 +85,16 @@ class Viewer(QMainWindow):
         ### Data Queues
         self.rx_queues = [queue.Queue() for _ in range(len(self.usrp_config))]
         self.disp_queue = queue.Queue(maxsize=10000)
+        self.cal_disp_queue = queue.Queue(maxsize=10000)
 
-        ### Calibration state - fully separate from recording (mutually exclusive)
+        ### Calibration state - fully separate from recording (mutually exclusive), but reuses
+        ### self.rx_queues plus its own SaveWorker/DisplayWorker instances so calibration also
+        ### gets live plots and (when Save? is checked) an .h5 file, same as a normal recording
         self.calibrating = False
-        self.cal_rx_queues = [queue.Queue() for _ in range(len(self.usrp_config))]
         self.usrp_cal_tx_thread = [None] * len(self.usrp_config)
         self.usrp_cal_rx_thread = [None] * len(self.usrp_config)
-        self.cal_analysis_thread = None
+        self.cal_save_thread = None
+        self.cal_display_thread = None
         self.calibration_analyzer = None
 
         ### Make Connections
@@ -401,6 +404,9 @@ class Viewer(QMainWindow):
         self.calibration_panel.set_running(True)
         self.update_buttons()
 
+        # Sets T=0 and the save-file path, same as a normal recording
+        self.annotate_event_panel.set_start_time()
+
         for idx, cfg in enumerate(self.usrp_config):
             self.usrp_cal_tx_thread[idx] = CalibrationTransmitWorker(
                 config=cfg,
@@ -417,20 +423,37 @@ class Viewer(QMainWindow):
                 usrp=self.usrps[idx],
                 config=cfg,
                 rx_streamer=self.rx_streamers[idx],
-                rx_queue=self.cal_rx_queues[idx],
+                rx_queue=self.rx_queues[idx],
                 running=True,
             )
             self.usrp_cal_rx_thread[idx].logEvent.connect(self.log_display_panel.log_message)
             self.usrp_cal_rx_thread[idx].start()
 
-        self.calibration_analyzer = CalibrationAnalyzer(self.exp_config)
-        self.cal_analysis_thread = CalibrationAnalysisWorker(
-            analyzer=self.calibration_analyzer,
-            rx_queues=self.cal_rx_queues,
+        # Live plots during calibration, same widget as a normal recording
+        self.cal_display_thread = DisplayWorker(
+            config=self.exp_config,
+            disp_queue=self.cal_disp_queue,
             running=True,
         )
-        self.cal_analysis_thread.logEvent.connect(self.log_display_panel.log_message)
-        self.cal_analysis_thread.start()
+        self.cal_display_thread.logEvent.connect(self.log_display_panel.log_message)
+        self.cal_display_thread.dataReady.connect(self.plot_grid.add_new_data)
+        self.cal_display_thread.start()
+
+        # Same SaveWorker normal recording uses - writes an .h5 file when Save? is checked,
+        # and (regardless of saving_status) emits data_ready for the calibration analyzer
+        self.cal_save_thread = SaveWorker(
+            exp_config=self.exp_config,
+            usrp_config=self.usrp_config,
+            rx_queues=self.rx_queues,
+            disp_queue=self.cal_disp_queue,
+            running=True,
+            saving=self.saving_status,
+        )
+        self.cal_save_thread.logEvent.connect(self.log_display_panel.log_message)
+
+        self.calibration_analyzer = CalibrationAnalyzer(self.exp_config, save_iq=self.cal_save_thread.save_iq)
+        self.cal_save_thread.data_ready.connect(self.calibration_analyzer.add_chunk)
+        self.cal_save_thread.start()
 
     def finish_calibration(self):
         if not self.calibrating:
@@ -449,10 +472,15 @@ class Viewer(QMainWindow):
                 rx_thread.wait()
                 self.usrp_cal_rx_thread[idx] = None
 
-        if self.cal_analysis_thread is not None:
-            self.cal_analysis_thread.stop()
-            self.cal_analysis_thread.wait()
-            self.cal_analysis_thread = None
+        if self.cal_save_thread is not None:
+            self.cal_save_thread.stop()
+            self.cal_save_thread.wait()
+            self.cal_save_thread = None
+
+        if self.cal_display_thread is not None:
+            self.cal_display_thread.stop()
+            self.cal_display_thread.wait()
+            self.cal_display_thread = None
 
         channels = self.calibration_analyzer.result() if self.calibration_analyzer is not None else {}
         try:
@@ -567,9 +595,12 @@ class Viewer(QMainWindow):
             if self.usrp_cal_rx_thread[idx] is not None:
                 self.usrp_cal_rx_thread[idx].stop()
                 self.usrp_cal_rx_thread[idx].wait()
-        if self.cal_analysis_thread is not None:
-            self.cal_analysis_thread.stop()
-            self.cal_analysis_thread.wait()
+        if self.cal_save_thread is not None:
+            self.cal_save_thread.stop()
+            self.cal_save_thread.wait()
+        if self.cal_display_thread is not None:
+            self.cal_display_thread.stop()
+            self.cal_display_thread.wait()
         self.calibrating = False
 
     

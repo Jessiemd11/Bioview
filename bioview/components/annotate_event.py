@@ -174,17 +174,25 @@ class AnnotateEventPanel(QGroupBox):
     # Session lifecycle
     # ------------------------------------------------------------------
     def set_start_time(self):
-        """Define T=0 and open the log files."""
+        """Define T=0 and point at this run's (not-yet-created) log path."""
         self.start_time = time.monotonic()
         self._hw_offset = None
         self._last_press.clear()
         self.refresh_path()
 
     def refresh_path(self):
-        """Update the log path and (re)open the file handles."""
+        """Update the log path. Does not touch disk - files are only created
+        lazily, by _open_files(), the first time a mark is actually recorded,
+        so a run with zero annotations leaves no log/sidecar files behind."""
         self._close_files()
         self.log_path = self.config.get_log_path()
+        self.logEvent.emit(
+            'info', f'Annotation path updated to: {self.log_path}'
+        )
 
+    def _open_files(self):
+        """Actually create/open the log + sidecar files. Called on demand,
+        the first time record_annotation() has something to write."""
         try:
             self._log_file = open(
                 self.log_path, 'a', encoding=self.ENCODING, newline=''
@@ -203,11 +211,6 @@ class AnnotateEventPanel(QGroupBox):
                 self._sidecar_file.flush()
         except Exception as e:
             self.logEvent.emit('error', f'Could not open annotation log: {e}')
-            return
-
-        self.logEvent.emit(
-            'info', f'Annotation path updated to: {self.log_path}'
-        )
 
     def _close_files(self):
         for handle in (self._log_file, self._sidecar_file):
@@ -258,7 +261,7 @@ class AnnotateEventPanel(QGroupBox):
                 return
 
             if self._log_file is None:
-                self.refresh_path()
+                self._open_files()
                 if self._log_file is None:
                     return
 
