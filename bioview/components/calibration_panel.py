@@ -1,12 +1,18 @@
 import qtawesome as qta
-from PyQt6.QtWidgets import QGroupBox, QPushButton, QHBoxLayout, QVBoxLayout, QLabel
-from PyQt6.QtCore import pyqtSignal, QEvent, Qt
+from PyQt6.QtWidgets import QGroupBox, QPushButton, QHBoxLayout, QLabel
+from PyQt6.QtCore import pyqtSignal, QEvent
 
 from bioview.types import ConnectionStatus, RunningStatus, ChannelQualityStatus
 from bioview.utils import get_qcolor
 from bioview.components.device_status import LEDIndicator
 
 class CalibrationPanel(QGroupBox):
+    '''
+    Compact, single-row calibration control: one button plus one small
+    LEDIndicator per Tx/Rx channel pair (hover an indicator for its quality/
+    SNR detail). Sized to fit alongside the Log/Mark Event panels in the
+    right-hand column rather than the taller two-row layout it started as.
+    '''
     calibrationRequested = pyqtSignal()
 
     def __init__(self, channel_labels: list, parent=None):
@@ -14,33 +20,26 @@ class CalibrationPanel(QGroupBox):
         self.channel_labels = list(channel_labels)
         self.calibrating = False
 
-        layout = QVBoxLayout()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setSpacing(6)
 
-        top_row = QHBoxLayout()
-        self.calibrate_button = QPushButton('   Calibrate')
+        self.calibrate_button = QPushButton(' Calibrate')
         self.calibrate_button.setIcon(qta.icon('fa6s.crosshairs', color=get_qcolor('teal')))
-        self.calibrate_button.setStyleSheet('padding: 8px;')
         self.calibrate_button.setEnabled(False)
         self.calibrate_button.clicked.connect(self.on_calibrate_clicked)
-        top_row.addWidget(self.calibrate_button)
+        layout.addWidget(self.calibrate_button)
 
-        self.summary_label = QLabel('')
-        top_row.addWidget(self.summary_label)
-        top_row.addStretch()
-        layout.addLayout(top_row)
-
-        # Four (or however many) traffic-light rows, one per Tx/Rx channel pair
-        lights_row = QHBoxLayout()
         self.indicators = {}
         for label in self.channel_labels:
-            col = QVBoxLayout()
-            indicator = LEDIndicator(ChannelQualityStatus.PENDING, size=16)
+            lbl = QLabel(label)
+            indicator = LEDIndicator(ChannelQualityStatus.PENDING, size=12)
+            indicator.setToolTip(f'{label}: not yet calibrated')
             self.indicators[label] = indicator
-            col.addWidget(indicator, alignment=Qt.AlignmentFlag.AlignHCenter)
-            col.addWidget(QLabel(label))
-            lights_row.addLayout(col)
-        layout.addLayout(lights_row)
+            layout.addWidget(lbl)
+            layout.addWidget(indicator)
 
+        layout.addStretch()
         self.setLayout(layout)
 
     def _update_icons(self):
@@ -64,16 +63,17 @@ class CalibrationPanel(QGroupBox):
         self.calibrating = running
         self.calibrate_button.setEnabled(not running)
         if running:
-            self.summary_label.setText('Calibrating...')
-            for indicator in self.indicators.values():
+            for label, indicator in self.indicators.items():
                 indicator.update_state(ChannelQualityStatus.PENDING)
+                indicator.setToolTip(f'{label}: calibrating...')
 
     def show_result(self, channels: dict):
-        parts = []
         for label, indicator in self.indicators.items():
             ch = channels.get(label)
             if ch is None:
                 continue
             indicator.update_state(ch['quality'])
-            parts.append(f"{label}: {ch['quality'].value[0]} (SNR {ch.get('snr_db', 0):.0f}dB)")
-        self.summary_label.setText(' | '.join(parts))
+            indicator.setToolTip(
+                f"{label}: {ch['quality'].value[0]} "
+                f"(amp {ch.get('amplitude', 0):.3g}, SNR {ch.get('snr_db', 0):.0f}dB)"
+            )

@@ -53,12 +53,14 @@ class DisplayWorker(QThread):
         while self.running:
             try:
                 # Get samples from queue
-                samples = self.disp_queue.get()                
+                samples = self.disp_queue.get(timeout=0.5)
                 # Process
                 processed = self._process(samples)                 
                 self.dataReady.emit(processed)
             except queue.Empty:
-                self.logEvent.emit('error', 'Queue Empty')
+                # Expected during idle gaps between batches now that get() is bounded
+                # (needed so stop() can actually break the loop) - not an error
+                self.logEvent.emit('debug', 'Display queue empty, waiting')
                 continue
             except Exception as e:
                 self.logEvent.emit('error', f'Display error: {e}')

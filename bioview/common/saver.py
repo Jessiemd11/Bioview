@@ -165,9 +165,9 @@ class SaveWorker(QThread):
         while self.running:
             try:
                 # Get from all queues
-                if len(data_buf) < self.buffer_size: 
-                    for idx, rx_q in enumerate(self.rx_queues): 
-                        samples[idx] = rx_q.get()
+                if len(data_buf) < self.buffer_size:
+                    for idx, rx_q in enumerate(self.rx_queues):
+                        samples[idx] = rx_q.get(timeout=0.5)
                     data_buf.append(np.transpose(np.vstack(samples)))    
                 else: 
                     # TODO: Correctly assign shapes

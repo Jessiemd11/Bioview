@@ -132,12 +132,6 @@ class Viewer(QMainWindow):
         self.app_control_panel.instructionsEnabled.connect(self.toggle_instructions)
         self.app_control_panel.balanceRequested.connect(self.balance_signals)
 
-        ### Calibration Panel
-        cal_labels = [label for row in self.exp_config.channel_mapping for label in row if label]
-        self.calibration_panel = CalibrationPanel(cal_labels)
-        controls_layout.addWidget(self.calibration_panel, stretch=1)
-        self.calibration_panel.calibrationRequested.connect(self.start_calibration)
-
         experiment_layout = QHBoxLayout()
         
         ### Experiment Control Panel
@@ -159,7 +153,14 @@ class Viewer(QMainWindow):
         top_layout.addLayout(controls_layout, stretch=3)   
         
         ### Metadata Panels
-        self.meta_panels = QVBoxLayout() 
+        self.meta_panels = QVBoxLayout()
+
+        # Calibration Panel - compact single row, sits above the log
+        cal_labels = [label for row in self.exp_config.channel_mapping for label in row if label]
+        self.calibration_panel = CalibrationPanel(cal_labels)
+        self.meta_panels.addWidget(self.calibration_panel, stretch=0)
+        self.calibration_panel.calibrationRequested.connect(self.start_calibration)
+
         # Status Panel - Experiment Log goes here
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
