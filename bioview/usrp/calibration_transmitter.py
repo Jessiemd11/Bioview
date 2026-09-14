@@ -12,14 +12,23 @@ TRI_FREQ_HZ = 10.0
 NUM_TRIANGLES = 5
 INJ_PERIOD_S = 1.0
 TRI_AMP = 0.5
-CHUNK = 4096
 
 class CalibrationTransmitWorker(QThread):
     '''
     Transmits gated triangle-wave-modulated IF tones (carrier * (1 + triangle))
-    on every Tx channel for duration_s seconds, then stops itself. Unlike
-    UsrpTransmitter, chunks are generated on the fly (the waveform evolves
-    with the gate) rather than replaying one precomputed buffer.
+    on every Tx channel for duration_s seconds, then stops itself.
+
+    The waveform for exactly one injection period is precomputed once in
+    __init__ (like UsrpTransmitter._generate_tx_waveforms()) and the same
+    buffer is resent every iteration, instead of regenerating a chunk from
+    scratch on every send - per-chunk regeneration (TriangleGenerator +
+    np.exp() every ~4ms) was heavy enough to starve the concurrent RX
+    thread of CPU/GIL time and cause device-side RX FIFO overflows.
+    A small, fixed phase discontinuity can occur at the once-per-period
+    buffer wraparound if if_freq * period_len / samp_rate isn't an exact
+    integer, but that always lands at the very start of the next gate burst
+    (pos == 0), which CalibrationAnalyzer's guard band around every on/off
+    transition already excludes from the gate-off reference measurement.
     '''
     logEvent = pyqtSignal(str, str)
     finished = pyqtSignal()
@@ -47,25 +56,26 @@ class CalibrationTransmitWorker(QThread):
         base_amp = config.get_param_value('tx_amplitude')
         self.tx_amplitude = [0.5 * a for a in base_amp]
 
-        self.tri = TriangleGenerator(
+        self.period_len = max(1, int(round(INJ_PERIOD_S * self.samp_rate)))
+        self.tx_waveform = self._generate_waveform()
+
+    def _generate_waveform(self):
+        ''' One full injection period, computed once. '''
+        tri_gen = TriangleGenerator(
             fs=self.samp_rate,
             freq=TRI_FREQ_HZ,
             n_tri=NUM_TRIANGLES,
             period_s=INJ_PERIOD_S,
             amplitude=TRI_AMP,
         )
-        self.n = 0
+        t = np.arange(self.period_len, dtype=np.float64) / self.samp_rate
+        tri, _ = tri_gen.next(self.period_len)
 
-    def _next_chunk(self, n):
-        t = (self.n + np.arange(n, dtype=np.float64)) / self.samp_rate
-        tri, _ = self.tri.next(n)
-
-        buf = np.empty((len(self.tx_channels), n), dtype=np.complex64)
+        buf = np.empty((len(self.tx_channels), self.period_len), dtype=np.complex64)
         for idx in range(len(self.tx_channels)):
             carrier = np.exp(1j * 2 * np.pi * self.if_freq[idx] * t)
             buf[idx] = (carrier * (1.0 + tri) * self.tx_amplitude[idx]).astype(np.complex64)
 
-        self.n += n
         return buf
 
     def run(self):
@@ -79,8 +89,7 @@ class CalibrationTransmitWorker(QThread):
         start_time = time.monotonic()
         while self.running and (time.monotonic() - start_time) < self.duration_s:
             try:
-                buf = self._next_chunk(CHUNK)
-                self.tx_streamer.send(buf, tx_metadata)
+                self.tx_streamer.send(self.tx_waveform, tx_metadata)
             except RuntimeError as ex:
                 self.logEvent.emit('error', f'Runtime error in calibration transmit: {ex}')
                 continue

@@ -15,7 +15,7 @@ from bioview.types import ConnectionStatus, RunningStatus, UsrpConfiguration, Ex
 from bioview.usrp import UsrpController, UsrpReceiver, UsrpTransmitter, CalibrationTransmitWorker
 from bioview.common import SaveWorker, DisplayWorker, InstructionsWorker, CalibrationAnalyzer, write_calibration_result
 from bioview.biopac import BiopacController
-from bioview.utils import get_channel_map
+from bioview.utils import get_channel_map, get_unique_path
     
 class Viewer(QMainWindow):
     def __init__(self, 
@@ -441,7 +441,9 @@ class Viewer(QMainWindow):
         self.cal_display_thread.start()
 
         # Same SaveWorker normal recording uses - writes an .h5 file when Save? is checked,
-        # and (regardless of saving_status) emits data_ready for the calibration analyzer
+        # and (regardless of saving_status) emits data_ready for the calibration analyzer.
+        # Named {file_name}_calibration.h5 so it's distinguishable from a normal recording.
+        cal_out_file = get_unique_path(self.exp_config.save_dir, f'{self.exp_config.file_name}_calibration.h5')
         self.cal_save_thread = SaveWorker(
             exp_config=self.exp_config,
             usrp_config=self.usrp_config,
@@ -449,6 +451,7 @@ class Viewer(QMainWindow):
             disp_queue=self.cal_disp_queue,
             running=True,
             saving=self.saving_status,
+            out_file=str(cal_out_file),
         )
         self.cal_save_thread.logEvent.connect(self.log_display_panel.log_message)
 

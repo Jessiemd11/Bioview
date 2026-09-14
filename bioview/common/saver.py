@@ -17,9 +17,10 @@ class SaveWorker(QThread):
                  rx_queues: list[queue.Queue], 
                  disp_queue: queue.Queue, 
                  running: bool = True,
-                 saving: bool = True, 
+                 saving: bool = True,
                  save_iq: bool = True,
-                 buffer_size: int = 2
+                 buffer_size: int = 2,
+                 out_file: str = None
         ):
         super().__init__()
         self.usrp_config = usrp_config
@@ -39,8 +40,9 @@ class SaveWorker(QThread):
         # Load IF filters
         self.if_filts = [self._load_filter(freq) for freq in exp_config.channel_ifs]
         
-        # Load output file
-        self.out_file = exp_config.get_save_path() 
+        # Load output file - callers (e.g. calibration) can override the default
+        # exp_config-derived path with their own out_file
+        self.out_file = out_file if out_file is not None else exp_config.get_save_path()
         if self.exp_config.save_phase:
             num_channels = 2 * len(exp_config.data_mapping)
         else:
