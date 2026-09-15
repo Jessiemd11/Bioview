@@ -6,12 +6,16 @@ from pathlib import Path
 
 from bioview.utils import get_unique_path, TriangleGenerator
 from bioview.types import ChannelQualityStatus
-from bioview.usrp.calibration_transmitter import TRI_FREQ_HZ, NUM_TRIANGLES, INJ_PERIOD_S
+from bioview.usrp.calibration_transmitter import TRI_FREQ_HZ, NUM_TRIANGLES, INJ_PERIOD_S, TRI_AMP
 
 # Internal, tunable-by-editing-code thresholds (kept out of the UI on purpose)
 MIN_AMPLITUDE = 1e-4     # below this, a channel is force-flagged POOR (likely dead/disconnected)
 GOOD_SNR_DB = 20.0
 MARGINAL_SNR_DB = 8.0
+
+# AM-to-AM curve: number of commanded-amplitude bins spanning [1-TRI_AMP, 1+TRI_AMP]
+# (the actual (1 + triangle) envelope CalibrationTransmitWorker applies to the carrier)
+NUM_AM_BINS = 16
 
 
 class CalibrationAnalyzer:
@@ -28,6 +32,15 @@ class CalibrationAnalyzer:
     constant excitation — the transmitter never goes silent — so the complex
     mean of the demodulated windows there *is* the channel's I/Q reference
     point (the transfer coefficient for that Tx->Rx pair).
+
+    The burst ("gate-on") segments aren't just a single on/off point either —
+    within a burst the triangle continuously ramps the commanded envelope
+    across its full range (0.5x-1.5x of the base carrier amplitude, for the
+    default TRI_AMP=0.5), sweeping through it 2*NUM_TRIANGLES times per
+    period. Binning every sample (on AND off) by its own instantaneous
+    commanded amplitude therefore builds a full AM-to-AM response curve
+    (measured amplitude vs. commanded amplitude) per channel from a single
+    fixed-amplitude run, with no need for a separate amplitude sweep.
     '''
     def __init__(self, exp_config, save_iq: bool = True):
         self.exp_config = exp_config
@@ -37,18 +50,24 @@ class CalibrationAnalyzer:
 
         self.stats = {}  # populated lazily as labels are seen in incoming payloads
 
-        # Shadow gate generator running at the *window* rate SaveWorker outputs at, with the
-        # same timing params as CalibrationTransmitWorker. Its counter starts at 0 here, at the
-        # same moment CalibrationTransmitWorker's does, so only the roughly-constant Tx->Rx
-        # pipeline latency needs absorbing (via a guard band), not true timestamp sync.
+        # Shadow gate/wave generator running at the *window* rate SaveWorker outputs at, with
+        # the same timing AND amplitude params as CalibrationTransmitWorker, so the values it
+        # reconstructs match the real commanded envelope exactly. Its counter starts at 0 here,
+        # at the same moment CalibrationTransmitWorker's does, so only the roughly-constant
+        # Tx->Rx pipeline latency needs absorbing (via a guard band), not true timestamp sync.
         self.gate_gen = TriangleGenerator(
             fs=self.save_rate, freq=TRI_FREQ_HZ, n_tri=NUM_TRIANGLES, period_s=INJ_PERIOD_S,
+            amplitude=TRI_AMP,
         )
         self.guard = max(1, int(round(self.save_rate * max(5.0 / self.if_filter_bw, 0.02 * INJ_PERIOD_S))))
         self.window_idx = 0
 
+        # Bin edges for the commanded envelope (1 + triangle), i.e. [1-TRI_AMP, 1+TRI_AMP]
+        self.am_bin_edges = np.linspace(1.0 - TRI_AMP, 1.0 + TRI_AMP, NUM_AM_BINS + 1)
+
     def _masks(self, n):
-        gate = self.gate_gen.next(n)[1] > 0.5
+        wave, gate_raw = self.gate_gen.next(n)
+        gate = gate_raw > 0.5
         on, off = gate.copy(), ~gate
         if self.guard > 0:
             edges = np.flatnonzero(np.diff(gate.astype(np.int8)) != 0) + 1
@@ -56,12 +75,15 @@ class CalibrationAnalyzer:
                 lo, hi = max(0, e - self.guard), min(n, e + self.guard)
                 on[lo:hi] = False
                 off[lo:hi] = False
-        return on, off
+        return wave, on, off
 
     def _stats_for(self, label):
         st = self.stats.get(label)
         if st is None:
-            st = dict(sum_off=0j, sumsq_off=0.0, n_off=0, sum_on=0j, n_on=0)
+            st = dict(
+                sum_off=0j, sumsq_off=0.0, n_off=0, sum_on=0j, n_on=0,
+                am_sum=np.zeros(NUM_AM_BINS), am_count=np.zeros(NUM_AM_BINS, dtype=np.int64),
+            )
             self.stats[label] = st
         return st
 
@@ -73,7 +95,13 @@ class CalibrationAnalyzer:
             return
 
         n = data.shape[1]
-        on_mask, off_mask = self._masks(n)
+        wave, on_mask, off_mask = self._masks(n)
+
+        # Instantaneous commanded envelope (1 + triangle) at every sample - already 0 (i.e.
+        # commanded == 1.0) outside the burst, since TriangleGenerator gates `wave` itself
+        commanded = 1.0 + wave.astype(np.float64)
+        bin_idx = np.clip(np.digitize(commanded, self.am_bin_edges) - 1, 0, NUM_AM_BINS - 1)
+        valid = on_mask | off_mask
 
         for label, channel_idx in mapping.items():
             comp0 = data[channel_idx, :, 0]
@@ -94,7 +122,24 @@ class CalibrationAnalyzer:
                 st['sum_on'] += y_on.sum()
                 st['n_on'] += y_on.size
 
+            if np.any(valid):
+                idxs = bin_idx[valid]
+                mags = np.abs(y[valid])
+                st['am_sum'] += np.bincount(idxs, weights=mags, minlength=NUM_AM_BINS)
+                st['am_count'] += np.bincount(idxs, minlength=NUM_AM_BINS).astype(np.int64)
+
         self.window_idx += n
+
+    def _am_to_am(self, st):
+        centers = (self.am_bin_edges[:-1] + self.am_bin_edges[1:]) / 2
+        counts = st['am_count']
+        have_data = counts > 0
+        response = np.divide(st['am_sum'], counts, out=np.zeros_like(st['am_sum']), where=have_data)
+        return dict(
+            commanded_amplitude=centers[have_data].tolist(),
+            response_amplitude=response[have_data].tolist(),
+            n_samples=counts[have_data].tolist(),
+        )
 
     def result(self):
         channels = {}
@@ -105,6 +150,7 @@ class CalibrationAnalyzer:
                     amplitude=0.0, phase_rad=0.0, complex_factor_re=0.0, complex_factor_im=0.0,
                     snr_db=0.0, quality=ChannelQualityStatus.POOR,
                     error='no gate-off samples captured',
+                    am_to_am=self._am_to_am(st),
                 )
                 continue
 
@@ -134,6 +180,7 @@ class CalibrationAnalyzer:
                 n_samples_off=int(n_off),
                 n_samples_on=int(st['n_on']),
                 quality=quality,
+                am_to_am=self._am_to_am(st),
             )
 
         return channels
