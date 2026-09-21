@@ -59,7 +59,8 @@ class AnnotateEventPanel(QGroupBox):
         self.log_path = config.get_log_path()
 
         self.start_time = None          # time.monotonic() at T=0
-        self._log_file = None           # kept open: open() can block for ms
+        self._output_stem = None        # <recording>.h5 path without extension
+        self._log_file = None           # opened on the first mark; kept open: open() can block for ms
         self._sidecar_file = None
         self._hw_offset = None          # hw clock -> monotonic clock offset
         self._last_press = {}           # key -> monotonic time of last accept
@@ -174,25 +175,32 @@ class AnnotateEventPanel(QGroupBox):
     # Session lifecycle
     # ------------------------------------------------------------------
     def set_start_time(self):
-        """Define T=0 and point at this run's (not-yet-created) log path."""
+        """Define T=0. No files are created here - see _open_files()."""
+        self._close_files()
+        self._output_stem = None
         self.start_time = time.monotonic()
         self._hw_offset = None
         self._last_press.clear()
-        self.refresh_path()
 
-    def refresh_path(self):
-        """Update the log path. Does not touch disk - files are only created
-        lazily, by _open_files(), the first time a mark is actually recorded,
-        so a run with zero annotations leaves no log/sidecar files behind."""
-        self._close_files()
-        self.log_path = self.config.get_log_path()
-        self.logEvent.emit(
-            'info', f'Annotation path updated to: {self.log_path}'
-        )
+    def set_output_path(self, data_path):
+        """Name the annotation files after this recording's data file.
+
+        The .log / _marks.csv take the .h5's stem so the pair always shares a
+        number. Deriving it independently (get_unique_path on the .log) would
+        drift out of step with the .h5 as soon as a recording without any
+        annotation leaves no .log behind.
+        """
+        self._output_stem = os.path.splitext(str(data_path))[0]
 
     def _open_files(self):
-        """Actually create/open the log + sidecar files. Called on demand,
-        the first time record_annotation() has something to write."""
+        """Create and open the annotation files. Called on the first mark only,
+        so a recording without annotations leaves no .log / .csv behind."""
+        self._close_files()
+        if self._output_stem is not None:
+            self.log_path = self._output_stem + '.log'
+        else:  # marked before any recording has started
+            self.log_path = str(self.config.get_log_path())
+
         try:
             self._log_file = open(
                 self.log_path, 'a', encoding=self.ENCODING, newline=''
@@ -211,6 +219,11 @@ class AnnotateEventPanel(QGroupBox):
                 self._sidecar_file.flush()
         except Exception as e:
             self.logEvent.emit('error', f'Could not open annotation log: {e}')
+            return
+
+        self.logEvent.emit(
+            'info', f'Annotation path updated to: {self.log_path}'
+        )
 
     def _close_files(self):
         for handle in (self._log_file, self._sidecar_file):

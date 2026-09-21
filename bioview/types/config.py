@@ -19,7 +19,11 @@ BASE_USRP_CONFIG = {
     'wire_format': 'sc16',
     'clock': 'internal',
     'pps': 'internal',
-    'if_filter_bw': 5e3,
+    # 25 kHz: comfortably clears CalibrationAnalyzer's need_bw floor
+    # (2 * MIN_HARMONICS * TRI_FREQ_HZ = 20 kHz) - see calibrator.py.
+    # A narrower value silently degrades calibration (harmonics filtered
+    # out) even though normal recording still works fine at 5 kHz.
+    'if_filter_bw': 25e3,
 }
 
 class UsrpConfiguration(): 

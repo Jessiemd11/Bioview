@@ -1,2 +1,71 @@
 # Bioview
+
 Bioview setup for NCS
+
+基於 PyPI 上 `bioview` 0.9.2(作者 Aakash Kapoor,GPL-v3)的修改版,用於 Ettus USRP B210 的 MIMO 量測。
+本 repo 可以直接用 `pip` 安裝,並附上啟動範例 `launch_bioview.py`。
+
+## 與上游 0.9.2 的差異
+
+- **三角波校正(Calibration probe)**:錄製開頭與結尾各插入一段 gated 三角波 AM 探測訊號(2 kHz × 5 週期,每 1 s 一次,兩個 Tx 輪流),
+  用來評估各通道品質並計算 CVI / LUT。結果存成 `<檔名>_calibration.json`,錄製結束後跳出 start / end 對照視窗。
+  - 分析器會在整段串流中自動找出 burst 的位置(Rx 緩衝造成的延遲每次不同),不需手動對齊。
+  - 每個時段先送 100 ms 的未調變載波,確保每個 burst 前都有穩定的載波參考。
+  - 視窗顯示每個通道中相關係數最高的 burst;曲線超出範圍時自動縮放並在標題註明,沒有可用 burst 的通道會明確標示。
+- **Annotation**:文字檔(`.log`)與 `_marks.csv` 只在**第一筆標註**時才建立;沒有標註的錄製不會留下這兩個檔案。
+  檔名沿用該次錄製 `.h5` 的名稱(例如 `example_2.h5` → `example_2.log`、`example_2_marks.csv`)。
+
+## 在新電腦上安裝(Windows 10/11)
+
+1. **Python 3.12 x64**
+   到 [python.org](https://www.python.org/downloads/windows/) 下載 3.12 x64 安裝檔,勾選 *Add python.exe to PATH*(並保留 `pip`、`venv`)。
+   本套件要求 Python `>=3.12,<3.13`,**3.13 不能用**。安裝後在命令提示字元確認:`python --version`
+2. **UHD 4.8.0.0**
+   到 <https://files.ettus.com/binaries/> 下載 `uhd_4.8.0.0-release` 的 Windows 安裝檔並安裝(建議勾選驅動與 FPGA images 下載器)。
+   安裝完成後**重新開啟**命令提示字元或 PowerShell。
+3. **USB 驅動(B200 / B210)**
+   接上 B210(USB 3.0 埠),用 [Zadig](https://zadig.akeo.ie/) 選擇 B200/B210 裝置並安裝 **WinUSB** 驅動。
+4. **FPGA 映像檔與裝置測試**
+   若安裝 UHD 時沒有勾選 FPGA images,請執行 `uhd_images_downloader`(或重跑安裝程式並勾選)。接著測試:
+   ```bat
+   uhd_find_devices
+   uhd_usrp_probe
+   ```
+   `uhd_find_devices` 要能看到 B210。
+5. **建立虛擬環境**
+   ```bat
+   python -m venv bioview_env
+   bioview_env\Scripts\activate
+   ```
+6. **安裝 BioView(本 repo 的修改版)**
+   ```bat
+   pip install git+https://github.com/Jessiemd11/Bioview.git
+   ```
+   會自動安裝 numpy(<2)、PyQt6、pyqtgraph、scipy、h5py、matplotlib、qtawesome、pygame、darkdetect 與 Python 版 `uhd`。
+   若程式在其他分支,在網址後加 `@分支名`。
+
+   > 單純 `pip install bioview` 只會裝到 PyPI 上**未修改**的版本(沒有校正功能與上述 annotation 修改)。
+7. **確認安裝**
+   ```bat
+   python -c "import uhd, bioview; print('ok')"
+   ```
+8. **執行**
+   取得 `launch_bioview.py`(`git clone` 本 repo,或直接下載該檔),依需求修改參數後:
+   ```bat
+   bioview_env\Scripts\activate
+   python launch_bioview.py
+   ```
+   - `save_dir`:預設為使用者的 `Downloads` 資料夾,可改成其他路徑。
+   - `if_freq`、`rx_gain`、`tx_gain`、`samp_rate` 等為 USRP 參數,依實驗調整。
+   - 程式會在目前資料夾寫入 `crash.log`(faulthandler)。
+
+### 常見問題
+
+- `import uhd` 失敗:確認已安裝 UHD 4.8.0.0 並**重開終端機**;虛擬環境內要有 `uhd` 套件(`pip show uhd`)。
+- 偵測不到 B210:重跑 Zadig 安裝 WinUSB、換 USB 3.0 埠/線、再執行 `uhd_find_devices`。
+- 舊的批次檔(例如 `launch bioview.bat`)內是寫死的絕對路徑,換電腦時需改成新電腦上的虛擬環境與腳本路徑。
+- BIOPAC 整合需自行取得 BIOPAC Hardware API,本 repo 不包含。
+
+## 授權
+
+GPL-v3,見 [LICENSE](LICENSE)。原始著作權屬上游 BioView 作者 Aakash Kapoor;本 repo 為其修改版。

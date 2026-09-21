@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+crash.log
+*.h5
+*.log
+*_marks.csv
+*_calibration.json
+bioview_env/
+dist/

@@ -2,20 +2,20 @@
 import uhd
 import time
 
-import os 
+import os
 import queue
-import logging 
+import logging
 
 from PyQt6.QtWidgets import QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QStatusBar
 from PyQt6.QtGui import QIcon, QGuiApplication
-from PyQt6.QtCore import QMutex, Qt
+from PyQt6.QtCore import QMutex, Qt, QTimer
 
-from bioview.components import UsrpDeviceConfigPanel, LogDisplayPanel, ExperimentSettingsPanel, PlotGrid, AppControlPanel, AnnotateEventPanel, DeviceStatusPanel, TextDialog, CalibrationPanel
+from bioview.components import UsrpDeviceConfigPanel, LogDisplayPanel, ExperimentSettingsPanel, PlotGrid, AppControlPanel, AnnotateEventPanel, DeviceStatusPanel, TextDialog, CalibrationPanel, CalibrationProbeDialog
 from bioview.types import ConnectionStatus, RunningStatus, UsrpConfiguration, ExperimentConfiguration
 from bioview.usrp import UsrpController, UsrpReceiver, UsrpTransmitter, CalibrationTransmitWorker
 from bioview.common import SaveWorker, DisplayWorker, InstructionsWorker, CalibrationAnalyzer, write_calibration_result
 from bioview.biopac import BiopacController
-from bioview.utils import get_channel_map, get_unique_path
+from bioview.utils import get_channel_map
     
 class Viewer(QMainWindow):
     def __init__(self, 
@@ -85,17 +85,18 @@ class Viewer(QMainWindow):
         ### Data Queues
         self.rx_queues = [queue.Queue() for _ in range(len(self.usrp_config))]
         self.disp_queue = queue.Queue(maxsize=10000)
-        self.cal_disp_queue = queue.Queue(maxsize=10000)
 
-        ### Calibration state - fully separate from recording (mutually exclusive), but reuses
-        ### self.rx_queues plus its own SaveWorker/DisplayWorker instances so calibration also
-        ### gets live plots and (when Save? is checked) an .h5 file, same as a normal recording
-        self.calibrating = False
+        ### Calibration state - a short probe episode is injected into the
+        ### same Tx/Rx/Save stream right after a recording starts and right
+        ### before it stops (see start_recording/stop_recording), instead of
+        ### calibration being its own separate session.
+        self.calibration_enabled = False
         self.usrp_cal_tx_thread = [None] * len(self.usrp_config)
-        self.usrp_cal_rx_thread = [None] * len(self.usrp_config)
-        self.cal_save_thread = None
-        self.cal_display_thread = None
-        self.calibration_analyzer = None
+        self.calibration_analyzers = {}     # phase ('start'/'end') -> CalibrationAnalyzer
+        self.calibration_results = {}       # phase -> {label: {...result, cvi, lut}}
+        self._cal_phase = None              # phase currently in progress, or None
+        self._cal_tx_finished_count = 0
+        self._calibration_probe_dialog = None
 
         ### Make Connections
         self._connect_logging()
@@ -131,7 +132,7 @@ class Viewer(QMainWindow):
         self.app_control_panel.saveRequested.connect(self.update_save_state)
         self.app_control_panel.instructionsEnabled.connect(self.toggle_instructions)
         self.app_control_panel.balanceRequested.connect(self.balance_signals)
-
+        
         experiment_layout = QHBoxLayout()
         
         ### Experiment Control Panel
@@ -159,7 +160,7 @@ class Viewer(QMainWindow):
         cal_labels = [label for row in self.exp_config.channel_mapping for label in row if label]
         self.calibration_panel = CalibrationPanel(cal_labels)
         self.meta_panels.addWidget(self.calibration_panel, stretch=0)
-        self.calibration_panel.calibrationRequested.connect(self.start_calibration)
+        self.calibration_panel.calibrationEnabled.connect(self.update_calibration_state)
 
         # Status Panel - Experiment Log goes here
         self.logger = logging.getLogger(__name__)
@@ -290,100 +291,230 @@ class Viewer(QMainWindow):
             self.bio_init_thread.wait()
         
     def start_recording(self):
-        # Update state 
+        # Update state
         self.running_status = RunningStatus.RUNNING
         self.connection_status = ConnectionStatus.CONNECTED
-        
+
         # This will set T=0 AND update the file path.
         self.annotate_event_panel.set_start_time()
-        
-        # Start streaming threads
-        for idx, cfg in enumerate(self.usrp_config):
-            self.usrp_tx_thread[idx] = UsrpTransmitter(
-                config = cfg, 
-                usrp = self.usrps[idx], 
-                tx_streamer = self.tx_streamers[idx]
-            )
-            self.usrp_tx_thread[idx].logEvent.connect(self.log_display_panel.log_message)
-            self.usrp_tx_thread[idx].start()
-         
+
+        self.calibration_analyzers = {}
+        self.calibration_results = {}
+        self._cal_phase = None
+
         # Start receiving threads
         for idx, cfg in enumerate(self.usrp_config):
             self.usrp_rx_thread[idx] = UsrpReceiver(
-                usrp = self.usrps[idx], 
-                config = cfg, 
-                rx_streamer = self.rx_streamers[idx], 
+                usrp = self.usrps[idx],
+                config = cfg,
+                rx_streamer = self.rx_streamers[idx],
                 rx_queue = self.rx_queues[idx],
                 running = self.running_status.value
             )
             self.usrp_rx_thread[idx].logEvent.connect(self.log_display_panel.log_message)
             self.usrp_rx_thread[idx].start()
-        
-        # Start display thread 
+
+        # Start display thread
         self.display_thread = DisplayWorker(
-            config = self.exp_config, 
-            disp_queue = self.disp_queue, 
+            config = self.exp_config,
+            disp_queue = self.disp_queue,
             running = self.running_status.value
         )
         self.display_thread.logEvent.connect(self.log_display_panel.log_message)
-        self.display_thread.dataReady.connect(self.plot_grid.add_new_data)        
+        self.display_thread.dataReady.connect(self.plot_grid.add_new_data)
         self.display_thread.start()
-        
-        # Start saving thread 
+
+        # Start saving thread - one continuous file for the whole recording;
+        # any calibration probe bursts injected below end up in this same
+        # file/stream, since they really are injected into the same antenna.
         self.save_thread = SaveWorker(
-            exp_config = self.exp_config, 
+            exp_config = self.exp_config,
             usrp_config = self.usrp_config,
-            rx_queues = self.rx_queues, 
-            disp_queue = self.disp_queue, 
-            running = self.running_status.value, 
+            rx_queues = self.rx_queues,
+            disp_queue = self.disp_queue,
+            running = self.running_status.value,
             saving = self.saving_status
         )
         self.save_thread.logEvent.connect(self.log_display_panel.log_message)
         self.save_thread.start()
-        
+        # Annotation files (if any get created) share the data file's name
+        self.annotate_event_panel.set_output_path(self.save_thread.out_file)
+
         # Start instructions
         if self.enable_instructions:
             self.instructions_thread = InstructionsWorker(config = self.exp_config)
             self.instructions_thread.textUpdate.connect(self.instruction_dialog.update_instruction_text)
             self.instructions_thread.logEvent.connect(self.log_display_panel.log_message)
             self.instructions_thread.start()
-            
-        # Start all threads together 
-        
-        
-        # Update UI 
+
+        if self.calibration_enabled:
+            # Normal Tx doesn't start yet - the calibration probe is injected
+            # first (once Rx/Save are already running), and normal Tx takes
+            # over once that episode finishes. 0.2s settle window against
+            # startup transients before injecting the first burst.
+            QTimer.singleShot(200, lambda: self._begin_calibration_episode('start'))
+        else:
+            self._start_normal_transmit()
+
+        # Update UI
         self.update_buttons()
-         
+
+    def _start_normal_transmit(self):
+        for idx, cfg in enumerate(self.usrp_config):
+            self.usrp_tx_thread[idx] = UsrpTransmitter(
+                config = cfg,
+                usrp = self.usrps[idx],
+                tx_streamer = self.tx_streamers[idx]
+            )
+            self.usrp_tx_thread[idx].logEvent.connect(self.log_display_panel.log_message)
+            self.usrp_tx_thread[idx].start()
+
+    def _begin_calibration_episode(self, phase):
+        # Guards against a Stop click landing in the 0.2s settle window
+        if self.running_status != RunningStatus.RUNNING:
+            return
+
+        self.calibration_panel.set_running(True)
+
+        # Construct the calibration Tx workers (and pay their waveform
+        # precompute cost, which generates a ~1s buffer per Tx channel) BEFORE
+        # constructing/connecting the analyzer. The analyzer's shadow
+        # TriangleGenerator starts its own "period 0" clock the moment
+        # add_chunk() first runs, which follows immediately from connecting
+        # data_ready to an already-flowing stream - if Tx construction cost
+        # sits between that connect and .start(), it directly adds to the gap
+        # between "analyzer thinks period 0 starts" and "Tx actually starts
+        # sending", which only has to exceed MAX_LAG_S to make every burst in
+        # the episode unrecoverable. Keep .start() as the very last step.
+        self._cal_phase = phase
+        self._cal_tx_finished_count = 0
+        for idx, cfg in enumerate(self.usrp_config):
+            self.usrp_cal_tx_thread[idx] = CalibrationTransmitWorker(
+                config=cfg,
+                usrp=self.usrps[idx],
+                tx_streamer=self.tx_streamers[idx],
+                num_cycles=3,
+            )
+            self.usrp_cal_tx_thread[idx].logEvent.connect(self.log_display_panel.log_message)
+            self.usrp_cal_tx_thread[idx].finished.connect(self._on_calibration_tx_finished)
+
+        analyzer = CalibrationAnalyzer(self.exp_config, save_iq=self.save_thread.save_iq)
+        self.calibration_analyzers[phase] = analyzer
+        self.save_thread.data_ready.connect(analyzer.add_chunk)
+
+        for cal_tx_thread in self.usrp_cal_tx_thread:
+            cal_tx_thread.start()
+
+    def _on_calibration_tx_finished(self):
+        self._cal_tx_finished_count += 1
+        if self._cal_tx_finished_count < len(self.usrp_config):
+            return   # wait for every device's calibration episode to finish
+
+        for cal_tx_thread in self.usrp_cal_tx_thread:
+            if cal_tx_thread is not None:
+                cal_tx_thread.wait()
+
+        phase = self._cal_phase
+        analyzer = self.calibration_analyzers[phase]
+        self.save_thread.data_ready.disconnect(analyzer.add_chunk)
+
+        # The analyzer's live shadow clock is anchored on a stale first chunk;
+        # re-anchor on where the probe really is and replay.
+        analyzer = analyzer.realigned()
+        self.calibration_analyzers[phase] = analyzer
+
+        result = analyzer.result()
+        self.calibration_results[phase] = {
+            label: dict(res, cvi=analyzer.compute_cvi(label), lut=analyzer.compute_lut(label))
+            for label, res in result.items()
+        }
+        self.calibration_panel.show_result(result)
+        self._cal_phase = None
+
+        if phase == 'start':
+            self._start_normal_transmit()
+        else:
+            self._finish_stop_recording()
+
+    def _abort_calibration_threads(self):
+        for cal_tx_thread in self.usrp_cal_tx_thread:
+            if cal_tx_thread is not None:
+                cal_tx_thread.stop()
+                cal_tx_thread.wait()
+        if self._cal_phase is not None and self.save_thread is not None:
+            analyzer = self.calibration_analyzers.get(self._cal_phase)
+            if analyzer is not None:
+                try:
+                    self.save_thread.data_ready.disconnect(analyzer.add_chunk)
+                except TypeError:
+                    pass   # already disconnected
+        self._cal_phase = None
+
     def stop_recording(self):
+        if self.calibration_enabled and self.running_status == RunningStatus.RUNNING:
+            # Stop normal Tx only - Rx/Save/Display keep running for the
+            # end-of-recording calibration episode, which shares this same file.
+            for tx_thread in self.usrp_tx_thread:
+                if tx_thread is not None:
+                    tx_thread.stop()
+                    tx_thread.wait()
+            self._begin_calibration_episode('end')
+            return
+
+        self._finish_stop_recording()
+
+    def _finish_stop_recording(self):
         # Update state
         self.running_status = RunningStatus.STOPPED
         self.connection_status = ConnectionStatus.CONNECTED
-        
+
         # Stop receiving threads
         for rx_thread in self.usrp_rx_thread:
-            if rx_thread is not None: 
+            if rx_thread is not None:
                 rx_thread.stop()
-        
-        # Stop instruction 
+
+        # Stop instruction
         if self.instructions_thread is not None:
             self.instructions_thread.stop()
-            
+
         # Stop saving thread
-        if self.save_thread is not None: 
+        if self.save_thread is not None:
             self.save_thread.stop()
-        
+
         # Stop display thread
-        if self.display_thread is not None: 
+        if self.display_thread is not None:
             self.display_thread.stop()
-        
-        # Stop streaming threads
+
+        # Stop streaming threads (already stopped in the calibration-enabled
+        # path above, but harmless / still needed for the non-calibration path)
         for tx_thread in self.usrp_tx_thread:
-            if tx_thread is not None: 
+            if tx_thread is not None:
                 tx_thread.stop()
-    
-        # Update UI 
+
+        # Update UI
         self.update_buttons()
-     
+
+        if 'start' in self.calibration_results and 'end' in self.calibration_results:
+            self._show_calibration_outputs()
+
+    def _show_calibration_outputs(self):
+        start_analyzer = self.calibration_analyzers.get('start')
+        end_analyzer = self.calibration_analyzers.get('end')
+        start_view = start_analyzer.probe_view_sample() if start_analyzer is not None else {}
+        end_view = end_analyzer.probe_view_sample() if end_analyzer is not None else {}
+
+        self._calibration_probe_dialog = CalibrationProbeDialog(start_view, end_view, parent=self)
+        self._calibration_probe_dialog.show()
+
+        try:
+            out_path = write_calibration_result(self.exp_config, self.usrp_config, self.calibration_results)
+            self.log_display_panel.log_message('debug', f'Calibration results saved to {out_path}')
+        except Exception as e:
+            self.log_display_panel.log_message('error', f'Failed to save calibration results: {e}')
+
+    def update_calibration_state(self, flag):
+        self.calibration_enabled = flag
+
     def balance_signals(self):
         # TODO: Implement signal balancing here 
         pass 
@@ -392,112 +523,6 @@ class Viewer(QMainWindow):
         self.app_control_panel.update_button_states(self.connection_status, self.running_status)
         self.experiment_settings_panel.update_button_states(self.connection_status, self.running_status)
         self.calibration_panel.update_button_states(self.connection_status, self.running_status)
-
-    def start_calibration(self):
-        # Mutually exclusive with Recording - guarded here even though the button is already
-        # disabled in that state, since update_button_states is the only other gate
-        if self.calibrating or self.running_status == RunningStatus.RUNNING:
-            return
-        if self.connection_status != ConnectionStatus.CONNECTED:
-            return
-
-        self.calibrating = True
-        self.calibration_panel.set_running(True)
-        self.update_buttons()
-
-        # Sets T=0 and the save-file path, same as a normal recording
-        self.annotate_event_panel.set_start_time()
-
-        for idx, cfg in enumerate(self.usrp_config):
-            self.usrp_cal_tx_thread[idx] = CalibrationTransmitWorker(
-                config=cfg,
-                usrp=self.usrps[idx],
-                tx_streamer=self.tx_streamers[idx],
-                duration_s=30.0,
-            )
-            self.usrp_cal_tx_thread[idx].logEvent.connect(self.log_display_panel.log_message)
-            if idx == 0:
-                self.usrp_cal_tx_thread[idx].finished.connect(self.finish_calibration)
-            self.usrp_cal_tx_thread[idx].start()
-
-            self.usrp_cal_rx_thread[idx] = UsrpReceiver(
-                usrp=self.usrps[idx],
-                config=cfg,
-                rx_streamer=self.rx_streamers[idx],
-                rx_queue=self.rx_queues[idx],
-                running=True,
-            )
-            self.usrp_cal_rx_thread[idx].logEvent.connect(self.log_display_panel.log_message)
-            self.usrp_cal_rx_thread[idx].start()
-
-        # Live plots during calibration, same widget as a normal recording
-        self.cal_display_thread = DisplayWorker(
-            config=self.exp_config,
-            disp_queue=self.cal_disp_queue,
-            running=True,
-        )
-        self.cal_display_thread.logEvent.connect(self.log_display_panel.log_message)
-        self.cal_display_thread.dataReady.connect(self.plot_grid.add_new_data)
-        self.cal_display_thread.start()
-
-        # Same SaveWorker normal recording uses - writes an .h5 file when Save? is checked,
-        # and (regardless of saving_status) emits data_ready for the calibration analyzer.
-        # Named {file_name}_calibration.h5 so it's distinguishable from a normal recording.
-        cal_out_file = get_unique_path(self.exp_config.save_dir, f'{self.exp_config.file_name}_calibration.h5')
-        self.cal_save_thread = SaveWorker(
-            exp_config=self.exp_config,
-            usrp_config=self.usrp_config,
-            rx_queues=self.rx_queues,
-            disp_queue=self.cal_disp_queue,
-            running=True,
-            saving=self.saving_status,
-            out_file=str(cal_out_file),
-        )
-        self.cal_save_thread.logEvent.connect(self.log_display_panel.log_message)
-
-        self.calibration_analyzer = CalibrationAnalyzer(self.exp_config, save_iq=self.cal_save_thread.save_iq)
-        self.cal_save_thread.data_ready.connect(self.calibration_analyzer.add_chunk)
-        self.cal_save_thread.start()
-
-    def finish_calibration(self):
-        if not self.calibrating:
-            return
-
-        for idx in range(len(self.usrp_config)):
-            tx_thread = self.usrp_cal_tx_thread[idx]
-            if tx_thread is not None:
-                tx_thread.stop()
-                tx_thread.wait()
-                self.usrp_cal_tx_thread[idx] = None
-
-            rx_thread = self.usrp_cal_rx_thread[idx]
-            if rx_thread is not None:
-                rx_thread.stop()
-                rx_thread.wait()
-                self.usrp_cal_rx_thread[idx] = None
-
-        if self.cal_save_thread is not None:
-            self.cal_save_thread.stop()
-            self.cal_save_thread.wait()
-            self.cal_save_thread = None
-
-        if self.cal_display_thread is not None:
-            self.cal_display_thread.stop()
-            self.cal_display_thread.wait()
-            self.cal_display_thread = None
-
-        channels = self.calibration_analyzer.result() if self.calibration_analyzer is not None else {}
-        try:
-            out_path = write_calibration_result(self.exp_config, self.usrp_config, channels)
-            self.log_display_panel.log_message('info', f'Calibration saved to {out_path}')
-        except Exception as e:
-            self.log_display_panel.log_message('error', f'Failed to save calibration results: {e}')
-
-        self.calibration_panel.show_result(channels)
-        self.calibration_analyzer = None
-        self.calibrating = False
-        self.calibration_panel.set_running(False)
-        self.update_buttons()
     
     def on_usrp_init_success(self, usrp, tx_streamer, rx_streamer, idx=0):
         self.usrps[idx] = usrp
@@ -577,35 +602,9 @@ class Viewer(QMainWindow):
             self.instruction_dialog.toggle_ui(self.enable_instructions)
         
     def closeEvent(self, a0):
-        # Ensure all threads are closed
-        self.stop_recording()
-        return super().closeEvent(a0)
-
-
-    def closeEvent(self, a0):
-        self.stop_recording()
+        # Ensure all threads are closed - hard-abort rather than trying to
+        # run a graceful end-of-recording calibration episode on app close.
         self._abort_calibration_threads()
+        self._finish_stop_recording()
         self.annotate_event_panel.shutdown()
         return super().closeEvent(a0)
-
-    def _abort_calibration_threads(self):
-        # Used on app close mid-calibration - just tears threads down, no result/save
-        if not self.calibrating:
-            return
-        for idx in range(len(self.usrp_config)):
-            if self.usrp_cal_tx_thread[idx] is not None:
-                self.usrp_cal_tx_thread[idx].stop()
-                self.usrp_cal_tx_thread[idx].wait()
-            if self.usrp_cal_rx_thread[idx] is not None:
-                self.usrp_cal_rx_thread[idx].stop()
-                self.usrp_cal_rx_thread[idx].wait()
-        if self.cal_save_thread is not None:
-            self.cal_save_thread.stop()
-            self.cal_save_thread.wait()
-        if self.cal_display_thread is not None:
-            self.cal_display_thread.stop()
-            self.cal_display_thread.wait()
-        self.calibrating = False
-
-    
-

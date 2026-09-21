@@ -17,10 +17,9 @@ class SaveWorker(QThread):
                  rx_queues: list[queue.Queue], 
                  disp_queue: queue.Queue, 
                  running: bool = True,
-                 saving: bool = True,
+                 saving: bool = True, 
                  save_iq: bool = True,
-                 buffer_size: int = 2,
-                 out_file: str = None
+                 buffer_size: int = 2
         ):
         super().__init__()
         self.usrp_config = usrp_config
@@ -39,41 +38,58 @@ class SaveWorker(QThread):
         
         # Load IF filters
         self.if_filts = [self._load_filter(freq) for freq in exp_config.channel_ifs]
-        
-        # Load output file - callers (e.g. calibration) can override the default
-        # exp_config-derived path with their own out_file
-        self.out_file = out_file if out_file is not None else exp_config.get_save_path()
+        # Baseband anti-alias LPF, applied after downconversion and before
+        # decimation - one per Tx/IF column, same indexing as if_filts
+        self.baseband_filts = [self._load_baseband_filter() for _ in exp_config.channel_ifs]
+
+        # Load output file
+        self.out_file = exp_config.get_save_path()
         if self.exp_config.save_phase:
             num_channels = 2 * len(exp_config.data_mapping)
         else:
             num_channels = len(exp_config.data_mapping)
         if self.saving:
-            init_save_file(file_path = self.out_file, 
-                           num_channels = num_channels, 
+            init_save_file(file_path = self.out_file,
+                           num_channels = num_channels,
                            chunk_size=500)
-        
+
         # Initialize states for all valid declared channel combinations
         self.phase_accumulator = {}
         self.filter_states = {}
+        self.baseband_filter_states = {}
+        self.decim_remainder = {}
         for ch_key in self.exp_config.data_mapping.keys():
             self.phase_accumulator[ch_key] = 0.0
-            self.filter_states[ch_key] = None            
+            self.filter_states[ch_key] = None
+            self.baseband_filter_states[ch_key] = None
+            self.decim_remainder[ch_key] = np.zeros(0, dtype=complex)
 
-    def _load_filter(self, freq: float, order: int = 2): 
+    def _load_filter(self, freq: float, order: int = 4):
         bandwidth = self.exp_config.if_filter_bw
         low_cutoff = freq - bandwidth / 2
         high_cutoff = freq + bandwidth / 2
-        
-        filter = get_filter(bounds=[low_cutoff, high_cutoff], 
+
+        filter = get_filter(bounds=[low_cutoff, high_cutoff],
                             samp_rate=self.exp_config.samp_rate,
                             btype='band', order=order)
         return filter
-    
-    def _process_chunk(self, 
-                       data, 
-                       filter, 
-                       if_freq, 
-                       channel_key
+
+    def _load_baseband_filter(self, cutoff: float = 12e3, order: int = 4):
+        # Real anti-alias LPF ahead of the save_ds decimation - a plain block
+        # average (the old approach) is not steep enough to protect the
+        # triangle calibration probe's harmonics (~2/6/10 kHz) from aliasing.
+        # 12 kHz clears those with margin and is far above real motion content.
+        filter = get_filter(bounds=[cutoff],
+                            samp_rate=self.exp_config.samp_rate,
+                            btype='low', order=order)
+        return filter
+
+    def _process_chunk(self,
+                       data,
+                       filter,
+                       if_freq,
+                       channel_key,
+                       t_idx
         ):
         # Early return for empty data
         if len(data) == 0:
@@ -109,21 +125,25 @@ class SaveWorker(QThread):
         
         # Update phase accumulator for next buffer (mod 2π to prevent numerical drift)
         self.phase_accumulator[channel_key] = (phases[-1] + phase_increment)
-        
-        # Downsampling logic
-        step = self.exp_config.save_ds
-        end_idx = len(baseband_data) - step + 1
-        num_windows = (end_idx + step - 1) // step  # Calculate the number of windows
 
-        if num_windows <= 0:
+        # Anti-alias LPF before decimation (a plain block average is not a
+        # steep enough filter to protect the triangle probe's harmonics)
+        current_bb_state = self.baseband_filter_states.get(channel_key)
+        bb_filt, new_bb_state = apply_filter(baseband_data, self.baseband_filts[t_idx], zi=current_bb_state)
+        self.baseband_filter_states[channel_key] = new_bb_state
+
+        # Decimate, carrying any leftover (<save_ds) samples from the previous
+        # chunk so the decimation phase stays continuous across chunk boundaries
+        # instead of silently dropping a tail every chunk
+        step = self.exp_config.save_ds
+        stream = np.concatenate([self.decim_remainder[channel_key], bb_filt])
+        n_full = (len(stream) // step) * step
+        self.decim_remainder[channel_key] = stream[n_full:]
+
+        if n_full == 0:
             return np.array([]), np.array([])
 
-        # Create indices for the start of each window
-        start_indices = np.arange(0, end_idx, step)
-        
-        # Use advanced indexing to get all the windows
-        window_indices = start_indices[:, np.newaxis] + np.arange(step)
-        windows = baseband_data[window_indices]  
+        windows = stream[:n_full].reshape(-1, step)
 
         if self.save_iq:
             first_comp = np.mean(np.real(windows), axis=1)
@@ -135,26 +155,31 @@ class SaveWorker(QThread):
         return first_comp, second_comp
     
     def _process(self, buffer):
-        # Use numpy preallocated array for speed 
-        num_channels = len(self.exp_config.data_mapping)
-        save_list = np.empty((num_channels, int(buffer.shape[1] // self.exp_config.save_ds), 2))
-        
+        # Output length per channel is no longer a fixed function of
+        # buffer.shape[1] now that decimation carries a remainder across
+        # chunks (and buffer width itself can vary, see ReceiveWorker) - so
+        # collect per-channel results and stack afterward instead of writing
+        # into a size-preallocated array.
+        results = {}
+
         for r_idx, row in enumerate(self.exp_config.channel_mapping):
             x = buffer[r_idx, :]
-            for t_idx, channel_key in enumerate(row): 
+            for t_idx, channel_key in enumerate(row):
                 channel_idx = self.exp_config.data_mapping[channel_key]
                 # Pass the channel key for state tracking
                 first_comp, second_comp = self._process_chunk(
-                    data = x, 
-                    filter = self.if_filts[t_idx], 
-                    if_freq = self.exp_config.channel_ifs[t_idx], 
-                    channel_key = channel_key
+                    data = x,
+                    filter = self.if_filts[t_idx],
+                    if_freq = self.exp_config.channel_ifs[t_idx],
+                    channel_key = channel_key,
+                    t_idx = t_idx
                 )
                 self.logEvent.emit('debug', f'Processed channel {channel_key} with index {channel_idx}')
-                save_list[channel_idx, :, 0] = first_comp
-                save_list[channel_idx, :, 1] = second_comp
-        
+                results[channel_idx] = np.stack([first_comp, second_comp], axis=-1)
+
         # Return all processed samples
+        num_channels = len(self.exp_config.data_mapping)
+        save_list = np.stack([results[idx] for idx in range(num_channels)], axis=0)
         return save_list
     
     def run(self):
@@ -170,14 +195,14 @@ class SaveWorker(QThread):
                 if len(data_buf) < self.buffer_size:
                     for idx, rx_q in enumerate(self.rx_queues):
                         samples[idx] = rx_q.get(timeout=0.5)
-                    data_buf.append(np.transpose(np.vstack(samples)))    
-                else: 
+                    data_buf.append(np.transpose(np.vstack(samples)))
+                else:
                     # TODO: Correctly assign shapes
                     self.logEvent.emit('debug', f'Buffer size: {len(data_buf)} with elem shape {data_buf[0].shape}')
                     buffer_data = np.transpose(np.vstack(data_buf))
-                    processed = self._process(buffer_data) 
-                    self.logEvent.emit('debug', f'Processed data shape {processed.shape}')   
-                    
+                    processed = self._process(buffer_data)
+                    self.logEvent.emit('debug', f'Processed data shape {processed.shape}')
+
                     # Add to display queue
                     try:
                         self.disp_queue.put(processed)
@@ -191,12 +216,12 @@ class SaveWorker(QThread):
                     self.data_ready.emit({'data': processed, 'mapping': self.exp_config.data_mapping})
 
                     # Add to save queue as well (asynchronously save using save queue if performance is an issue)
-                    
-                    # Write to file, only if saving 
+
+                    # Write to file, only if saving
                     if self.saving:
                         update_save_file(self.out_file, processed)
-                    
-                    # Clear buffer 
+
+                    # Clear buffer
                     data_buf = []
             except queue.Empty:
                 self.logEvent.emit('debug', 'Rx Queue Empty')

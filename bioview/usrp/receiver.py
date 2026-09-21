@@ -113,16 +113,19 @@ class ReceiveWorker(QThread):
                 self.logEvent.emit('warning', f'Receiver Error: {rx_metadata.strerror()}')
 
             total_samps_received += num_rx_samps
-            
-            # Copy samples to avoid buffer overwrite and put in queue
+
+            # Copy only the samples actually written this call, and copy them
+            # out of recv_buffer before the next recv() overwrites it in place.
             # recv_buffer.dtype = np.complex64 (since default cpu_format = 'fc32')
-            try:
-                self.rx_queue.put((recv_buffer))
-            except queue.Full:
-                self.logEvent.emit('warning', 'Rx Queue full, dropping buffer')
-            except queue.Empty: 
-                self.logEvent.emit('debug', 'Rx Queue Empty')
-                continue
+            if num_rx_samps > 0:
+                rx_data = recv_buffer[:, :num_rx_samps].copy()
+                try:
+                    self.rx_queue.put(rx_data)
+                except queue.Full:
+                    self.logEvent.emit('warning', 'Rx Queue full, dropping buffer')
+                except queue.Empty:
+                    self.logEvent.emit('debug', 'Rx Queue Empty')
+                    continue
                 
         # Gracefully close once receiving is finished
         stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)

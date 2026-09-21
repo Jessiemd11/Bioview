@@ -7,3 +7,4 @@ from .annotate_event import AnnotateEventPanel
 from .device_status import DeviceStatusPanel
 from .text_dialog import TextDialog
 from .calibration_panel import CalibrationPanel
+from .calibration_probe_dialog import CalibrationProbeDialog

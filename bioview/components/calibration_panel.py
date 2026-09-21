@@ -1,34 +1,31 @@
-import qtawesome as qta
-from PyQt6.QtWidgets import QGroupBox, QPushButton, QHBoxLayout, QLabel
-from PyQt6.QtCore import pyqtSignal, QEvent
+from PyQt6.QtWidgets import QGroupBox, QCheckBox, QHBoxLayout, QLabel
+from PyQt6.QtCore import pyqtSignal
 
-from bioview.types import ConnectionStatus, RunningStatus, ChannelQualityStatus
-from bioview.utils import get_qcolor
+from bioview.types import RunningStatus, ChannelQualityStatus
 from bioview.components.device_status import LEDIndicator
 
 class CalibrationPanel(QGroupBox):
     '''
-    Compact, single-row calibration control: one button plus one small
-    LEDIndicator per Tx/Rx channel pair (hover an indicator for its quality/
-    SNR detail). Sized to fit alongside the Log/Mark Event panels in the
-    right-hand column rather than the taller two-row layout it started as.
+    Compact, single-row calibration control: one "Calibrate ?" checkbox
+    (same pattern as AppControlPanel's "Save ?") plus one small LEDIndicator
+    per Tx/Rx channel pair (hover an indicator for its quality/SNR detail).
+    When checked, a recording injects a short triangular-probe episode right
+    after it starts and right before it stops (see Viewer.start_recording/
+    stop_recording) instead of calibration being its own separate session.
     '''
-    calibrationRequested = pyqtSignal()
+    calibrationEnabled = pyqtSignal(bool)
 
     def __init__(self, channel_labels: list, parent=None):
         super().__init__('Calibration', parent)
         self.channel_labels = list(channel_labels)
-        self.calibrating = False
 
         layout = QHBoxLayout()
         layout.setContentsMargins(6, 2, 6, 2)
         layout.setSpacing(6)
 
-        self.calibrate_button = QPushButton(' Calibrate')
-        self.calibrate_button.setIcon(qta.icon('fa6s.crosshairs', color=get_qcolor('teal')))
-        self.calibrate_button.setEnabled(False)
-        self.calibrate_button.clicked.connect(self.on_calibrate_clicked)
-        layout.addWidget(self.calibrate_button)
+        self.calibrate_checkbox = QCheckBox(' Calibrate ?')
+        self.calibrate_checkbox.clicked.connect(self.on_calibrate_toggled)
+        layout.addWidget(self.calibrate_checkbox)
 
         self.indicators = {}
         for label in self.channel_labels:
@@ -42,38 +39,31 @@ class CalibrationPanel(QGroupBox):
         layout.addStretch()
         self.setLayout(layout)
 
-    def _update_icons(self):
-        self.calibrate_button.setIcon(qta.icon('fa6s.crosshairs', color=get_qcolor('teal')))
-
-    def event(self, event):
-        if event.type() == QEvent.Type.ApplicationPaletteChange:
-            self._update_icons()
-        return super().event(event)
-
-    def on_calibrate_clicked(self):
-        self.calibrationRequested.emit()
+    def on_calibrate_toggled(self):
+        self.calibrationEnabled.emit(self.calibrate_checkbox.isChecked())
 
     def update_button_states(self, connection_status, running_status):
-        can_calibrate = (connection_status == ConnectionStatus.CONNECTED
-                          and running_status != RunningStatus.RUNNING
-                          and not self.calibrating)
-        self.calibrate_button.setEnabled(can_calibrate)
+        self.calibrate_checkbox.setEnabled(running_status == RunningStatus.STOPPED)
 
     def set_running(self, running: bool):
-        self.calibrating = running
-        self.calibrate_button.setEnabled(not running)
+        '''Called at the start of a calibration episode to reset the LEDs to
+        PENDING while the probe is being injected/analyzed.'''
         if running:
             for label, indicator in self.indicators.items():
                 indicator.update_state(ChannelQualityStatus.PENDING)
                 indicator.setToolTip(f'{label}: calibrating...')
 
     def show_result(self, channels: dict):
+        '''Called once per episode, after CalibrationAnalyzer.result() has
+        run on the fully-resolved episode - not live/burst-by-burst.'''
         for label, indicator in self.indicators.items():
             ch = channels.get(label)
             if ch is None:
                 continue
             indicator.update_state(ch['quality'])
             indicator.setToolTip(
-                f"{label}: {ch['quality'].value[0]} "
-                f"(amp {ch.get('amplitude', 0):.3g}, SNR {ch.get('snr_db', 0):.0f}dB)"
+                f"{label}: {ch['quality'].value[0]} ({ch.get('reason', '')}) - "
+                f"gain {ch.get('mean_gain_db', float('nan')):.1f}dB, "
+                f"SNR {ch.get('mean_snr_db', float('nan')):.1f}dB, "
+                f"NCC {ch.get('mean_ncc', float('nan')):.2f}"
             )
