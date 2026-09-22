@@ -21,7 +21,7 @@ def get_usrp_address(device_name: str):
         print('Cache is empty')
         return None
         
-    return map_dict[device_name]
+    return map_dict.get(device_name)
 
 def update_usrp_address(device_name: str,
                         device_serial: str): 

@@ -18,12 +18,19 @@ class Controller(QThread):
         # Performs device discovery and initialization in its own separate thread.
         try:
             ser = get_usrp_address(self.config.device_name)
-            if ser is not None: 
-                addr = uhd.find(f'serial={ser}')[0]    
+            if ser is not None:
+                addr = uhd.find(f'serial={ser}')[0]
             else:
-                addr = uhd.find(self.config.device_name)[0]
+                found = uhd.find(self.config.device_args)
+                if not found:
+                    raise RuntimeError(
+                        f"No USRP device found for device_args='{self.config.device_args}'. "
+                        f"Check `uhd_find_devices`/`uhd_usrp_probe` and, if you have more than "
+                        f"one USRP, set device_args to e.g. 'serial=XXXXXXXX'."
+                    )
+                addr = found[0]
                 ser = addr['serial']
-                # Store it for future use 
+                # Store it for future use
                 update_usrp_address(self.config.device_name, ser)
             
             self.usrp = uhd.usrp.MultiUSRP(f'serial={ser},num_recv_frames=1024')

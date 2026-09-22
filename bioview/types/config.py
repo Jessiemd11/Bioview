@@ -39,6 +39,10 @@ class UsrpConfiguration():
     ):
         # Add inputs
         self.device_name = device_name
+        # Valid UHD device-args query string (e.g. 'type=b200', 'serial=XXXXXXXX') used to
+        # discover the device on first connection, before its serial gets cached against
+        # device_name. Empty string matches any connected device.
+        self.device_args = kwargs.get('device_args', '')
         self.if_freq = if_freq
         self.if_bandwidth = if_bandwidth
         self.rx_gain = rx_gain

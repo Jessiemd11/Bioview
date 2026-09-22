@@ -27,7 +27,8 @@ exp_config = ExperimentConfiguration(
 
 # USRP variables 
 usrp = UsrpConfiguration(
-    device_name = 'MyB210', 
+    device_name = 'MyB210',
+    device_args = 'type=b200',  # matches any single B200/B210; for multiple USRPs use 'serial=XXXXXXXX' (see `uhd_usrp_probe`)
     if_freq = [100e3, 140e3],
     if_bandwidth = 5e3, 
     rx_gain = [25, 35], 

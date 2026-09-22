@@ -23,7 +23,7 @@ dependencies = [
     "pyqtgraph (>=0.13.7,<0.14.0)",
     "qtawesome (>=1.4.0,<2.0.0)",
     "scipy (>=1.15.2,<2.0.0)",
-    "uhd (>=4.8.0.0,<5.0.0.0) ; sys_platform == 'win32'",
+    "uhd (==4.8.0.0) ; sys_platform == 'win32'",
 ]
 
 [tool.poetry]
