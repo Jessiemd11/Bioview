@@ -109,8 +109,9 @@ class SaveWorker(QThread):
     def _load_baseband_filter(self, cutoff: float = 12e3, order: int = 4):
         # Real anti-alias LPF ahead of the stage-1 (calibration-rate) decimation - a plain block
         # average (the old approach) is not steep enough to protect the
-        # triangle calibration probe's harmonics (~2/6/10 kHz) from aliasing.
-        # 12 kHz clears those with margin and is far above real motion content.
+        # asymmetric-triangle calibration probe (2 kHz fundamental + harmonics)
+        # from aliasing. 12 kHz keeps the main harmonics and is far above real
+        # motion content.
         filter = get_filter(bounds=[cutoff],
                             samp_rate=self.exp_config.samp_rate,
                             btype='low', order=order)

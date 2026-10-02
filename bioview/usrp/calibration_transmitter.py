@@ -7,7 +7,7 @@ from bioview.types import UsrpConfiguration
 from bioview.utils import TriangleGenerator, send_all
 
 # Fixed calibration injection parameters, tuned for this experiment protocol:
-# Atri=0.5, ftri=2 kHz, Tburst=2.5 ms, Trpt=1 s. Changing TRI_FREQ_HZ/
+# Atri=0.5, ftri=2 kHz, Tburst=2.5 ms, Trpt=1 s, 80/20 rise/fall. Changing TRI_FREQ_HZ/
 # NUM_TRIANGLES also changes what save_rate and if_filter_bw are required to
 # resolve the probe - see CalibrationAnalyzer._check_rates()
 # (bioview/common/calibrator.py), which is the single source of truth for
@@ -16,6 +16,13 @@ TRI_FREQ_HZ = 2000.0
 NUM_TRIANGLES = 5
 INJ_PERIOD_S = 1.0
 TRI_AMP = 0.5
+# Asymmetric triangle (sawtooth-like): ramps up for 80% of each cycle, falls in
+# the other 20%. With a symmetric triangle an inverted probe is identical to
+# one shifted by half a cycle, so a flipped channel can't be told apart from a
+# delayed one; asymmetry makes the probe's polarity identifiable (NCC sign,
+# CVI). Not a pure sawtooth (1.0): an instant drop would ring through the
+# IF/baseband filters and leave the LUT's fall ramp without samples.
+TRI_RISE_FRAC = 0.8
 # Unmodulated carrier sent before the first period so that *every* burst,
 # including the first, has a stable carrier both for its reference/pre-burst
 # window (CalibrationAnalyzer's h_amp, which needs MAX_LAG_S of carrier ahead of
@@ -25,7 +32,8 @@ LEAD_IN_S = 0.1
 
 class CalibrationTransmitWorker(QThread):
     '''
-    Transmits gated triangle-wave-modulated IF tones (carrier * (1 + triangle))
+    Transmits gated asymmetric-triangle-modulated IF tones (carrier * (1 + triangle),
+    see TRI_RISE_FRAC)
     for num_cycles * len(tx_channels) periods, then stops itself.
 
     Time-division multiplexed across Tx channels: only one Tx channel carries
@@ -100,6 +108,7 @@ class CalibrationTransmitWorker(QThread):
             n_tri=NUM_TRIANGLES,
             period_s=INJ_PERIOD_S,
             amplitude=TRI_AMP,
+            rise_frac=TRI_RISE_FRAC,
         )
         t = np.arange(self.period_len, dtype=np.float64) / self.samp_rate
         tri, _ = tri_gen.next(self.period_len)

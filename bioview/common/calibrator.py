@@ -9,7 +9,7 @@ from scipy.interpolate import PchipInterpolator
 from bioview.utils import get_unique_path, TriangleGenerator
 from bioview.types import ChannelQualityStatus
 from bioview.constants import INIT_DELAY
-from bioview.usrp.calibration_transmitter import TRI_FREQ_HZ, NUM_TRIANGLES, INJ_PERIOD_S, TRI_AMP
+from bioview.usrp.calibration_transmitter import TRI_FREQ_HZ, NUM_TRIANGLES, INJ_PERIOD_S, TRI_AMP, TRI_RISE_FRAC
 
 # ---------------------------------------------------------------------------
 # Tunable thresholds (kept out of the UI on purpose)
@@ -106,7 +106,7 @@ class CalibrationAnalyzer:
 
         self.gate_gen = TriangleGenerator(
             fs=self.save_rate, freq=TRI_FREQ_HZ, n_tri=NUM_TRIANGLES, period_s=INJ_PERIOD_S,
-            amplitude=TRI_AMP,
+            amplitude=TRI_AMP, rise_frac=TRI_RISE_FRAC,
         )
         self.burst_len = max(1, int(round(NUM_TRIANGLES / TRI_FREQ_HZ * self.save_rate)))
         self.pad = max(1, int(round(MAX_LAG_S * self.save_rate)))
@@ -304,7 +304,8 @@ class CalibrationAnalyzer:
         L = self.burst_len
         period = int(round(INJ_PERIOD_S * self.save_rate))
         tri, _ = TriangleGenerator(fs=self.save_rate, freq=TRI_FREQ_HZ, n_tri=NUM_TRIANGLES,
-                                   period_s=INJ_PERIOD_S, amplitude=TRI_AMP).next(L)
+                                   period_s=INJ_PERIOD_S, amplitude=TRI_AMP,
+                                   rise_frac=TRI_RISE_FRAC).next(L)
         t = tri.astype(np.float64) - tri.mean()
         t /= max(t.std(), _EPS)
 
@@ -494,7 +495,9 @@ class CalibrationAnalyzer:
     @staticmethod
     def _artifact_hint(m):
         '''Raw-magnitude hint only. Biphasic twist depends on the recentered
-        trajectory, so the definitive check is the offline CVI analysis.'''
+        trajectory, so the definitive check is the offline CVI analysis.
+        The probe is asymmetric (TRI_RISE_FRAC), so an inverted probe can't
+        masquerade as a half-cycle lag - a negative NCC really is a flip.'''
         c = m['ncc']
         if abs(c) < MIN_PROBE_NCC:
             return 'probe_not_seen'
@@ -666,6 +669,19 @@ class CalibrationAnalyzer:
         bursts = self._bursts_by_tx.get(tx_idx) if tx_idx is not None else None
         return bursts if bursts else self._all_bursts
 
+    def _aligned_rx(self, rec, metrics, label, n):
+        ''' The n Rx samples of `label` lined up with tx_wave[P:P+n], using the
+        burst's measured lag - or None if the lag pushes them out of the
+        padded snippet. '''
+        rx = rec['rx'].get(label)
+        if rx is None:
+            return None
+        m = metrics.get(label)
+        lo = self.pad + (int(m['lag_samples']) if m is not None else 0)
+        if lo < 0 or lo + n > len(rx):
+            return None
+        return rx[lo:lo + n]
+
     def compute_cvi(self, label):
         '''Paper Sec. IV-B: grid search over a complex translation r*e^(j*theta)
         that maximizes NCC between the corrected Rx magnitude and the Tx
@@ -674,19 +690,26 @@ class CalibrationAnalyzer:
         theta) across every stored burst for robustness against a single
         noisy burst - this is the value written to the saved calibration
         JSON, independent of whichever burst the probe-view dialog happens
-        to display.'''
-        L, P = self.burst_len, self.pad
+        to display.
+
+        The probe is asymmetric (TRI_RISE_FRAC), so the NCC sign is meaningful:
+        the search maximizes the *signed* NCC, i.e. picks the translation that
+        also restores the probe's polarity if the raw magnitude is flipped.
+        raw_ncc / flipped report the untranslated polarity, corrected whether
+        the chosen translation ends up positively correlated.'''
+        L = self.burst_len
         seg_len = min(CVI_SEARCH_LEN, L)
 
-        rs, thetas, nccs = [], [], []
-        for rec, _metrics in self._bursts_for_label(label):
-            rx = rec['rx'].get(label)
-            if rx is None:
+        rs, thetas, nccs, raw_nccs = [], [], [], []
+        for rec, metrics in self._bursts_for_label(label):
+            z = self._aligned_rx(rec, metrics, label, seg_len)
+            if z is None:
                 continue
-            z = rx[P:P + seg_len].astype(np.complex128)
-            tri = rec['tx_wave'][P:P + seg_len].astype(np.float64)
-            if tri.std() < _EPS:
+            z = z.astype(np.complex128)
+            tri = rec['tx_wave'][self.pad:self.pad + seg_len].astype(np.float64)
+            if tri.std() < _EPS or np.abs(z).std() < _EPS:
                 continue
+            raw_ncc = float(np.corrcoef(np.abs(z), tri)[0, 1])
 
             best = None
             for r in CVI_R_STEPS:
@@ -696,17 +719,21 @@ class CalibrationAnalyzer:
                     if mag.std() < _EPS:
                         continue
                     ncc = float(np.corrcoef(mag, tri)[0, 1])
-                    if best is None or abs(ncc) > abs(best[2]):
+                    if best is None or ncc > best[2]:
                         best = (float(r), float(theta), ncc)
             if best is not None:
                 rs.append(best[0])
                 thetas.append(best[1])
                 nccs.append(best[2])
+                raw_nccs.append(raw_ncc)
 
         if not rs:
             return None
         theta_mean = float(np.angle(np.mean(np.exp(1j * np.asarray(thetas))))) % (2 * np.pi)
-        return dict(r=float(np.mean(rs)), theta=theta_mean, ncc=float(np.mean(nccs)), n_bursts=len(rs))
+        ncc_mean = float(np.mean(nccs))
+        raw_ncc_mean = float(np.mean(raw_nccs))
+        return dict(r=float(np.mean(rs)), theta=theta_mean, ncc=ncc_mean, n_bursts=len(rs),
+                    raw_ncc=raw_ncc_mean, flipped=raw_ncc_mean < 0, corrected=ncc_mean > 0)
 
     def compute_lut(self, label):
         '''Paper Eq. 10: PCHIP mapping from distorted Rx magnitude to the
@@ -720,11 +747,11 @@ class CalibrationAnalyzer:
         L, P = self.burst_len, self.pad
         rise_rx, rise_tx, fall_rx, fall_tx = [], [], [], []
 
-        for rec, _metrics in self._bursts_for_label(label):
-            rx = rec['rx'].get(label)
+        for rec, metrics in self._bursts_for_label(label):
+            rx = self._aligned_rx(rec, metrics, label, L)
             if rx is None:
                 continue
-            y = np.abs(rx[P:P + L]).astype(np.float64)
+            y = np.abs(rx).astype(np.float64)
             tri = rec['tx_wave'][P:P + L].astype(np.float64)
             if len(tri) < 2:
                 continue
@@ -864,14 +891,14 @@ def write_calibration_result(exp_config, usrp_config, phase_channels):
     )
 
     probe = dict(tri_freq_hz=TRI_FREQ_HZ, num_triangles=NUM_TRIANGLES,
-                 inj_period_s=INJ_PERIOD_S, tri_amp=TRI_AMP)
+                 inj_period_s=INJ_PERIOD_S, tri_amp=TRI_AMP, tri_rise_frac=TRI_RISE_FRAC)
 
     labels = sorted({label for ch in phase_channels.values() for label in ch})
     channels = {label: {phase: ch.get(label) for phase, ch in phase_channels.items()}
                 for label in labels}
 
     doc = dict(
-        schema_version=3,
+        schema_version=4,
         generator='bioview.common.calibrator',
         timestamp_iso=datetime.datetime.now().isoformat(),
         presettings=presettings,
