@@ -96,7 +96,9 @@ class CalibrationAnalyzer:
         # stream were perfectly fresh - see realigned()).
         self.exp_config = exp_config
         self.save_iq = save_iq
-        self.save_rate = float(exp_config.samp_rate) / float(exp_config.save_ds)
+        # Rate of the stream SaveWorker emits on data_ready (stage 1), not
+        # the (lower) rate actually written to file
+        self.save_rate = float(exp_config.samp_rate) / float(exp_config.analysis_ds())
         self.if_filter_bw = float(exp_config.if_filter_bw)
 
         self.warnings = []
@@ -181,7 +183,7 @@ class CalibrationAnalyzer:
             ok = False
             self.warnings.append(
                 f'save_rate {self.save_rate:.0f} Hz < {need_fs:.0f} Hz: triangle probe is '
-                f'under-sampled, burst morphology cannot be recovered (lower save_ds).')
+                f'under-sampled, burst morphology cannot be recovered (lower cal_ds).')
         # if_filter_bw assumed to be the full band-pass width around f_IF
         need_bw = 2 * MIN_HARMONICS * TRI_FREQ_HZ
         if self.if_filter_bw < need_bw:
@@ -853,6 +855,7 @@ def write_calibration_result(exp_config, usrp_config, phase_channels):
         save_dir=exp_config.save_dir,
         samp_rate=exp_config.samp_rate,
         save_ds=exp_config.save_ds,
+        cal_ds=exp_config.analysis_ds(),
         disp_ds=exp_config.disp_ds,
         if_filter_bw=exp_config.if_filter_bw,
         save_phase=exp_config.save_phase,

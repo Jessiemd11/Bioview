@@ -24,12 +24,14 @@ def init_save_file(file_path,
             chunks=(num_channels, chunk_size)
         )
     
-def update_save_file(file_path, chunk):
+def append_save_chunk(dset, chunk):
+    ''' Append a processed chunk to an already-open 'data' dataset. '''
     save_chunk = np.vstack([chunk[:, :, 0], chunk[:, :, 1]]) # num_channels x num_samples (all real followed by all imag)
-    
+    cur_cols = dset.shape[1]
+    new_cols = cur_cols + save_chunk.shape[1]
+    dset.resize((save_chunk.shape[0], new_cols))
+    dset[:, cur_cols:new_cols] = save_chunk
+
+def update_save_file(file_path, chunk):
     with h5py.File(file_path, 'a') as f:
-        dset = f['data']
-        cur_cols = dset.shape[1]
-        new_cols = cur_cols + save_chunk.shape[1]
-        dset.resize((save_chunk.shape[0], new_cols))
-        dset[:, cur_cols:new_cols] = save_chunk
+        append_save_chunk(f['data'], chunk)

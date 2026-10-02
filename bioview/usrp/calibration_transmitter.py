@@ -4,7 +4,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from bioview.constants import INIT_DELAY
 from bioview.types import UsrpConfiguration
-from bioview.utils import TriangleGenerator
+from bioview.utils import TriangleGenerator, send_all
 
 # Fixed calibration injection parameters, tuned for this experiment protocol:
 # Atri=0.5, ftri=2 kHz, Tburst=2.5 ms, Trpt=1 s. Changing TRI_FREQ_HZ/
@@ -132,9 +132,7 @@ class CalibrationTransmitWorker(QThread):
         tx_metadata.time_spec = uhd.types.TimeSpec(self.usrp.get_time_now().get_real_secs() + INIT_DELAY)
 
         try:
-            self.tx_streamer.send(self.lead_in, tx_metadata)
-            tx_metadata.start_of_burst = False
-            tx_metadata.has_time_spec = False
+            send_all(self.tx_streamer, self.lead_in, tx_metadata, lambda: self.running)
         except RuntimeError as ex:
             # Flags stay set, so the first period's send() below still opens the burst
             self.logEvent.emit('error', f'Runtime error in calibration lead-in: {ex}')
@@ -143,14 +141,14 @@ class CalibrationTransmitWorker(QThread):
         while self.running and period_idx < self.total_periods:
             waveform = self.tx_waveforms[period_idx % len(self.tx_waveforms)]
             try:
-                self.tx_streamer.send(waveform, tx_metadata)
+                sent = send_all(self.tx_streamer, waveform, tx_metadata, lambda: self.running)
             except RuntimeError as ex:
                 self.logEvent.emit('error', f'Runtime error in calibration transmit: {ex}')
                 continue
 
+            if sent < waveform.shape[1] and self.running:
+                self.logEvent.emit('warning', f'Calibration Tx sent only {sent} of {waveform.shape[1]} samples')
             period_idx += 1
-            tx_metadata.start_of_burst = False
-            tx_metadata.has_time_spec = False
 
         # End transmission
         tx_metadata.end_of_burst = True

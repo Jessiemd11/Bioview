@@ -146,3 +146,61 @@ def read_file(fpath: str | Path,
                 data_dict[ch].append(complex(values[idx*2+1], values[idx*2+2])) 
     
     return data_dict
+
+def send_all(tx_streamer, buf, tx_metadata, keep_going=lambda: True, timeout: float = 1.0, max_timeouts: int = 5):
+    '''
+    send() the whole of buf, resending only the unsent remainder after a
+    partial/timed-out send so the waveform stays phase-continuous (restarting
+    from sample 0 would put a phase jump in the carrier). Gives up early once
+    keep_going() returns False, or after max_timeouts consecutive sends that
+    accepted nothing (device not draining). Returns the number of samples sent.
+    The start-of-burst / time-spec flags are cleared after the first chunk
+    that actually goes out, so a resend never re-opens the burst.
+    '''
+    total = buf.shape[-1]
+    sent = 0
+    timeouts = 0
+    while sent < total and timeouts < max_timeouts:
+        chunk = np.ascontiguousarray(buf[..., sent:]) if sent else buf
+        n = tx_streamer.send(chunk, tx_metadata, timeout)
+        if n > 0:
+            sent += n
+            tx_metadata.start_of_burst = False
+            tx_metadata.has_time_spec = False
+            timeouts = 0
+        elif not keep_going():
+            break
+        else:
+            timeouts += 1
+    return sent
+
+
+def drain_tx_async_msgs(tx_streamer, async_md):
+    """ Non-blocking: consume pending Tx async messages. Returns
+    (underflows, time_errors) - time_errors being late / sequence errors. """
+    import uhd
+    codes = uhd.types.TXMetadataEventCode
+    # Look names up defensively - the enum's members differ between UHD versions
+    pick = lambda *names: tuple(c for c in (getattr(codes, n, None) for n in names) if c is not None)
+    underflow_codes = pick('underflow', 'underflow_in_packet')
+    error_codes = pick('time_error', 'seq_error', 'seq_error_in_packet')
+    underflows = errors = 0
+    while tx_streamer.recv_async_msg(async_md, 0.0):
+        if async_md.event_code in underflow_codes:
+            underflows += 1
+        elif async_md.event_code in error_codes:
+            errors += 1
+    return underflows, errors
+
+
+def sample_index_at(secs: float, samp_rate: float) -> int:
+    """ First whole sample index (on the device clock's sample grid) at or after secs. """
+    return int(np.ceil(secs * samp_rate))
+
+
+def time_spec_from_sample(n: int, samp_rate: float):
+    """ Exact TimeSpec for device sample index n (full seconds + fraction, so
+    precision doesn't degrade as device time grows). """
+    import uhd
+    fs = int(round(samp_rate))
+    return uhd.types.TimeSpec(int(n // fs), float(n % fs) / samp_rate)

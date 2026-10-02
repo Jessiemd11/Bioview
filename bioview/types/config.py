@@ -1,3 +1,5 @@
+import math
+
 from PyQt6.QtCore import QMutex
 
 from bioview.utils import get_unique_path
@@ -131,7 +133,11 @@ class ExperimentConfiguration():
         self.disp_ds = disp_ds
         self.disp_filter_spec = disp_filter_spec        
         self.disp_channels = disp_channels
-        
+        # Decimation of the stream fed to CalibrationAnalyzer - it needs a far
+        # higher rate (>= 40 kHz for the 2 kHz triangle probe) than is worth
+        # saving to disk, so the saved stream is decimated further from it
+        self.cal_ds = kwargs.get('cal_ds', 20)
+
         # USRP-Specific Configuration Variables
         self.if_filter_bw = kwargs.get('if_filter_bw', BASE_USRP_CONFIG['if_filter_bw'])
         self.save_phase = save_phase
@@ -171,7 +177,12 @@ class ExperimentConfiguration():
         self.mutex.unlock()
         return value
         
-    def get_log_path(self): 
+    def analysis_ds(self):
+        ''' First-stage decimation (calibration rate). Always divides save_ds,
+        so the saved stream is a further integer decimation of it. '''
+        return math.gcd(int(self.save_ds), int(self.cal_ds))
+
+    def get_log_path(self):
         return get_unique_path(self.save_dir, f'{self.file_name}.log')
         
     def get_save_path(self):

@@ -15,7 +15,21 @@ from bioview.types import ConnectionStatus, RunningStatus, UsrpConfiguration, Ex
 from bioview.usrp import UsrpController, UsrpReceiver, UsrpTransmitter, CalibrationTransmitWorker
 from bioview.common import SaveWorker, DisplayWorker, InstructionsWorker, CalibrationAnalyzer, write_calibration_result
 from bioview.biopac import BiopacController
-from bioview.utils import get_channel_map
+from bioview.utils import get_channel_map, boost_process
+
+# The calibration analyzer is fed exactly the slice of the processed stream
+# that belongs to its episode, located by raw-sample count rather than by
+# wall-clock time: once the Save pipeline runs behind the radio (it did, by
+# several seconds, late in a long recording), "whatever arrives while the
+# calibration Tx is running" is stale pre-probe data and the probe itself is
+# still sitting in the Rx queue.
+# The window ends this long before the point the receivers had reached when
+# the calibration Tx finished. The last burst is ~1 s (one INJ_PERIOD_S)
+# before that point, so it is still included, while the next shadow-clock
+# onset (which would otherwise be scored as a bogus extra burst) is not.
+CAL_WINDOW_END_BEFORE_TX_DONE_S = 0.5
+# Give up waiting for the Save pipeline to reach the end of the window
+CAL_DRAIN_TIMEOUT_MS = 60000
     
 class Viewer(QMainWindow):
     def __init__(self, 
@@ -96,10 +110,20 @@ class Viewer(QMainWindow):
         self.calibration_results = {}       # phase -> {label: {...result, cvi, lut}}
         self._cal_phase = None              # phase currently in progress, or None
         self._cal_tx_finished_count = 0
+        self._cal_start_sample = None       # raw-sample window fed to the analyzer
+        self._cal_end_sample = None
+        self._cal_episode_id = 0
         self._calibration_probe_dialog = None
 
         ### Make Connections
         self._connect_logging()
+
+        ### Per-recording copy of the log panel, written next to the .h5
+        self._log_file_handler = None
+
+        ### Don't let Windows throttle the streaming threads
+        for level, msg in boost_process():
+            self.log_display_panel.log_message(level, msg)
     
     def _init_ui(self): 
         ### Define main wndow
@@ -336,9 +360,12 @@ class Viewer(QMainWindow):
             saving = self.saving_status
         )
         self.save_thread.logEvent.connect(self.log_display_panel.log_message)
+        self.save_thread.data_ready.connect(self._feed_calibration)
         self.save_thread.start()
         # Annotation files (if any get created) share the data file's name
         self.annotate_event_panel.set_output_path(self.save_thread.out_file)
+        if self.saving_status:
+            self._open_log_file(self.save_thread.out_file)
 
         # Start instructions
         if self.enable_instructions:
@@ -359,6 +386,22 @@ class Viewer(QMainWindow):
         # Update UI
         self.update_buttons()
 
+    def _open_log_file(self, data_path):
+        self._close_log_file()
+        # '_log.txt', not '.log' - the annotation panel already uses <stem>.log
+        log_path = os.path.splitext(str(data_path))[0] + '_log.txt'
+        # delay=True: the file is only created once something is logged
+        handler = logging.FileHandler(log_path, encoding='utf-8', delay=True)
+        handler.setFormatter(self.log_display_panel.log_handler.formatter)
+        self.logger.addHandler(handler)
+        self._log_file_handler = handler
+
+    def _close_log_file(self):
+        if self._log_file_handler is not None:
+            self.logger.removeHandler(self._log_file_handler)
+            self._log_file_handler.close()
+            self._log_file_handler = None
+
     def _start_normal_transmit(self):
         for idx, cfg in enumerate(self.usrp_config):
             self.usrp_tx_thread[idx] = UsrpTransmitter(
@@ -378,16 +421,18 @@ class Viewer(QMainWindow):
 
         # Construct the calibration Tx workers (and pay their waveform
         # precompute cost, which generates a ~1s buffer per Tx channel) BEFORE
-        # constructing/connecting the analyzer. The analyzer's shadow
-        # TriangleGenerator starts its own "period 0" clock the moment
-        # add_chunk() first runs, which follows immediately from connecting
-        # data_ready to an already-flowing stream - if Tx construction cost
-        # sits between that connect and .start(), it directly adds to the gap
-        # between "analyzer thinks period 0 starts" and "Tx actually starts
-        # sending", which only has to exceed MAX_LAG_S to make every burst in
-        # the episode unrecoverable. Keep .start() as the very last step.
+        # marking the start of the analyzer's window. The analyzer's shadow
+        # TriangleGenerator starts its own "period 0" clock at the first chunk
+        # it is fed - if Tx construction cost sits between marking that point
+        # and .start(), it directly adds to the gap between "analyzer thinks
+        # period 0 starts" and "Tx actually starts sending" (realigned()
+        # recovers from that, but keep it small). Keep .start() as the very
+        # last step.
         self._cal_phase = phase
         self._cal_tx_finished_count = 0
+        self._cal_start_sample = None
+        self._cal_end_sample = None
+        self._cal_episode_id += 1
         for idx, cfg in enumerate(self.usrp_config):
             self.usrp_cal_tx_thread[idx] = CalibrationTransmitWorker(
                 config=cfg,
@@ -400,10 +445,26 @@ class Viewer(QMainWindow):
 
         analyzer = CalibrationAnalyzer(self.exp_config, save_iq=self.save_thread.save_iq)
         self.calibration_analyzers[phase] = analyzer
-        self.save_thread.data_ready.connect(analyzer.add_chunk)
+        # From here on _feed_calibration passes processed data to the analyzer
+        self._cal_start_sample = self._rx_samples_received()
 
         for cal_tx_thread in self.usrp_cal_tx_thread:
             cal_tx_thread.start()
+
+    def _rx_samples_received(self):
+        counts = [rx.total_samps_received for rx in self.usrp_rx_thread if rx is not None]
+        return min(counts) if counts else 0
+
+    def _feed_calibration(self, payload):
+        if self._cal_phase is None or self._cal_start_sample is None:
+            return
+        analyzer = self.calibration_analyzers.get(self._cal_phase)
+        if analyzer is None or payload['end_sample'] <= self._cal_start_sample:
+            return   # data received before the episode started (pipeline backlog)
+        if self._cal_end_sample is None or payload['start_sample'] < self._cal_end_sample:
+            analyzer.add_chunk(payload)
+        if self._cal_end_sample is not None and payload['end_sample'] >= self._cal_end_sample:
+            self._finalize_calibration_episode()
 
     def _on_calibration_tx_finished(self):
         self._cal_tx_finished_count += 1
@@ -414,9 +475,35 @@ class Viewer(QMainWindow):
             if cal_tx_thread is not None:
                 cal_tx_thread.wait()
 
+        # Don't analyze yet - the probe may still be queued behind a backlog in
+        # the Save pipeline. _feed_calibration finalizes once processing gets
+        # to the end of the episode's window.
+        samp_rate = self.exp_config.samp_rate
+        self._cal_end_sample = max(
+            self._cal_start_sample + 1,
+            self._rx_samples_received() - int(CAL_WINDOW_END_BEFORE_TX_DONE_S * samp_rate))
+        lag_s = (self._cal_end_sample - self.save_thread.samples_processed) / samp_rate
+        if lag_s <= 0:
+            # Already processed (and fed) past the end of the window
+            self._finalize_calibration_episode()
+            return
+        if lag_s > 1.0:
+            self.log_display_panel.log_message('info', f'Calibration: waiting for {lag_s:.1f} s of queued data to be processed')
+        episode_id = self._cal_episode_id
+        QTimer.singleShot(CAL_DRAIN_TIMEOUT_MS, lambda: self._on_calibration_drain_timeout(episode_id))
+
+    def _on_calibration_drain_timeout(self, episode_id):
+        if episode_id != self._cal_episode_id or self._cal_phase is None or self._cal_end_sample is None:
+            return   # already finalized (or aborted)
+        self.log_display_panel.log_message('warning', 'Calibration: timed out waiting for the Save pipeline - analyzing the data received so far')
+        self._finalize_calibration_episode()
+
+    def _finalize_calibration_episode(self):
         phase = self._cal_phase
         analyzer = self.calibration_analyzers[phase]
-        self.save_thread.data_ready.disconnect(analyzer.add_chunk)
+        self._cal_phase = None
+        self._cal_start_sample = None
+        self._cal_end_sample = None
 
         # The analyzer's live shadow clock is anchored on a stale first chunk;
         # re-anchor on where the probe really is and replay.
@@ -429,7 +516,6 @@ class Viewer(QMainWindow):
             for label, res in result.items()
         }
         self.calibration_panel.show_result(result)
-        self._cal_phase = None
 
         if phase == 'start':
             self._start_normal_transmit()
@@ -441,14 +527,10 @@ class Viewer(QMainWindow):
             if cal_tx_thread is not None:
                 cal_tx_thread.stop()
                 cal_tx_thread.wait()
-        if self._cal_phase is not None and self.save_thread is not None:
-            analyzer = self.calibration_analyzers.get(self._cal_phase)
-            if analyzer is not None:
-                try:
-                    self.save_thread.data_ready.disconnect(analyzer.add_chunk)
-                except TypeError:
-                    pass   # already disconnected
+        # Stops _feed_calibration and any pending drain timeout
         self._cal_phase = None
+        self._cal_start_sample = None
+        self._cal_end_sample = None
 
     def stop_recording(self):
         if self.calibration_enabled and self.running_status == RunningStatus.RUNNING:
@@ -468,18 +550,24 @@ class Viewer(QMainWindow):
         self.running_status = RunningStatus.STOPPED
         self.connection_status = ConnectionStatus.CONNECTED
 
-        # Stop receiving threads
+        # Stop receiving threads first and let them exit, so that the Save
+        # thread can then flush everything they queued
         for rx_thread in self.usrp_rx_thread:
             if rx_thread is not None:
                 rx_thread.stop()
+        for rx_thread in self.usrp_rx_thread:
+            if rx_thread is not None:
+                rx_thread.wait()
 
         # Stop instruction
         if self.instructions_thread is not None:
             self.instructions_thread.stop()
 
-        # Stop saving thread
+        # Stop saving thread - it processes the remaining queued data and
+        # closes the file before exiting
         if self.save_thread is not None:
             self.save_thread.stop()
+            self.save_thread.wait()
 
         # Stop display thread
         if self.display_thread is not None:
@@ -497,6 +585,9 @@ class Viewer(QMainWindow):
         if 'start' in self.calibration_results and 'end' in self.calibration_results:
             self._show_calibration_outputs()
 
+        # After the calibration JSON message, so it is in the file too
+        self._close_log_file()
+
     def _show_calibration_outputs(self):
         start_analyzer = self.calibration_analyzers.get('start')
         end_analyzer = self.calibration_analyzers.get('end')
@@ -511,6 +602,10 @@ class Viewer(QMainWindow):
             self.log_display_panel.log_message('debug', f'Calibration results saved to {out_path}')
         except Exception as e:
             self.log_display_panel.log_message('error', f'Failed to save calibration results: {e}')
+
+        # Consume the results so a later _finish_stop_recording (e.g. from
+        # closeEvent) doesn't write a duplicate _calibration_2.json.
+        self.calibration_results = {}
 
     def update_calibration_state(self, flag):
         self.calibration_enabled = flag

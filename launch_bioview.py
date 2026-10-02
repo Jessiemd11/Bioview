@@ -14,8 +14,9 @@ faulthandler.enable(open('crash.log', 'w'), all_threads=True)
 exp_config = ExperimentConfiguration(
     save_dir = str(Path.home() / 'Downloads'),   # folder for saved files (change as needed)
     file_name = 'example',
-    save_ds = 20,
-    disp_ds = 50,
+    save_ds = 100,                  # saved file rate: samp_rate / save_ds
+    disp_ds = 10,                   # display rate: samp_rate / (save_ds * disp_ds)
+    cal_ds = 20,                    # calibration analysis rate: samp_rate / cal_ds (not saved)
     if_filter_bw = 24e3,
     disp_filter_spec = {
         'bounds': 10,

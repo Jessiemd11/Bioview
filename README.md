@@ -81,6 +81,11 @@ Bioview setup for NCS
 - 偵測不到 B210:重跑 Zadig 安裝 WinUSB、換 USB 3.0 埠/線、再執行 `uhd_find_devices`。
 - 舊的批次檔(例如 `launch bioview.bat`)內是寫死的絕對路徑,換電腦時需改成新電腦上的虛擬環境與腳本路徑。
 - BIOPAC 整合需自行取得 BIOPAC Hardware API,本 repo 不包含。
+- Log 出現 `Tx underflows` / `Tx restarted` / `Rx dropped ... samples` / `Save pipeline is X s behind`:代表電腦來不及處理 B210 的資料串流(Tx 斷訊或 Rx 掉樣本)。
+  程式會讓相位在斷點後自動對齊,但仍會留下短暫空白。錄製時建議:筆電接上電源、電源計畫選「高效能」、
+  關閉 USB 選擇性暫停與睡眠、B210 直接插 USB 3.0 埠、錄製中避免切換到其他吃資源的程式(影片、雲端同步、大量複製)、不要在錄製中調整增益。
+  程式啟動時會自動關閉 Windows 對 Bioview 的節能節流(EcoQoS)並將優先權設為「高」,結果會顯示在 Log。
+- 每次開啟存檔的錄製,Log 會同步存成 `<檔名>_log.txt`,與 `.h5` 放在同一資料夾。
 
 ## 授權
 
